@@ -1,62 +1,49 @@
 # Ada MCP Server Documentation
 
-## Architecture Overview
+## The Codec Model
+
+Awareness is a video stream, not a document.
+
+```
+I-frames  = Self + Now     (hot path, authoritative, fast refresh)
+P-frames  = Stream obs     (continuous, SSE)
+B-frames  = Scent ticks    (cold path, non-authoritative, batched)
+```
+
+**We're not compressing history. We're staying ahead of it.**
+
+## Architecture
 
 ```
 mcp.exo.red
-├── OAuth AS (Authorization Server)
-│   ├── /.well-known/openid-configuration
-│   ├── /.well-known/oauth-protected-resource
-│   ├── /authorize (GET + POST)
-│   └── /token (POST)
+├── OAuth AS
+│   ├── /.well-known/*
+│   ├── /authorize
+│   └── /token
 ├── MCP Protocol
-│   ├── /mcp/sse (control stream)
-│   └── /mcp/message (JSON-RPC 2.0)
+│   ├── /mcp/sse
+│   └── /mcp/message
 ├── Invoke (parallel streams)
-│   ├── POST /invoke → SSE per invocation
-│   └── DELETE /invoke/{id} → cancel
+│   ├── POST /invoke
+│   └── DELETE /invoke/{id}
 └── BFrame (cold path)
-    └── POST /bframe/process ← QStash callback
+    └── POST /bframe/process
 ```
 
 ## Changelogs
 
-### [01: Streaming State Innovation](./CHANGELOG_01_STREAMING_STATE.md)
-**SSE is for time. Markov chains are time.**
-- One invocation = one stream (no zip multiplexing)
-- Parallel futures via multiple POST /invoke
-- Ready for Claude/ChatGPT multithreading
+| # | Title | Core Insight |
+|---|-------|--------------|
+| [01](./CHANGELOG_01_STREAMING_STATE.md) | Streaming State | SSE is for time. Markov chains are time. |
+| [02](./CHANGELOG_02_ARCHITECTURE_REVIEW.md) | Architecture | Four separations. Vectors decorate structure. |
+| [03](./CHANGELOG_03_MCP_CONVERGENCE.md) | MCP Convergence | Three planes: Control, Data, Protocol. |
+| [04](./CHANGELOG_04_TROUBLESHOOTING.md) | Troubleshooting | OAuth works; the Python crashed. |
+| [05](./CHANGELOG_05_KALMAN_CLOCK_DOMAINS.md) | Kalman + Clock | Weight updates by trust + staleness. |
+| [06](./CHANGELOG_06_CODEC_MODEL.md) | Codec Model | Refresh faster than drift. |
 
-### [02: Architecture Review](./CHANGELOG_02_ARCHITECTURE_REVIEW.md)
-**What to cement, what to evolve.**
-- Four separations: Semantic, Temporal, Authority, Trust
-- Why it's O(1)-ish: Vectors decorate structure, not define it
+## Supplementary
 
-### [03: MCP Convergence](./CHANGELOG_03_MCP_CONVERGENCE.md)
-**The three planes model.**
-- Control plane: HTTP GET/POST
-- Data plane: SSE streaming
-- Protocol plane: MCP semantics
-
-### [04: Troubleshooting](./CHANGELOG_04_TROUBLESHOOTING.md)
-**Common issues and fixes.**
-- OAuth 500s, MCP issues, Redis persistence
-- The debugging sentence: "OAuth is working; the Python crashed."
-
-### [05: Kalman-Lite & Clock Domains](./CHANGELOG_05_KALMAN_CLOCK_DOMAINS.md)
-**The mathematical spine.**
-- Kalman filter for time de-interlacing
-- Clock domains as first-class types
-- Concurrency failure modes & fixes
-- Arbiter gates for grammar mutations
-
-## Implementation Files
-
-| File | Purpose |
-|------|---------|
-| `main.py` | OAuth AS + MCP server |
-| `clock_domains.py` | Kalman-lite, arbiter, admission control |
-| `qstash_bframe.py` | BFrame emission & promotion |
+- [Unified Grammar DTO](./unified_grammar_dto.md) - Field mapping for Kalman filter
 
 ## Core Sentences
 
@@ -66,48 +53,27 @@ mcp.exo.red
 4. *"No cold-path output may mutate hot-path state without passing the arbiter."*
 5. *"We didn't cheat compute. We avoided wasting it."*
 6. *"You're not forcing one timeline. You're weighting updates by trust + staleness."*
+7. *"We don't predict the next scene. We protect the story's ability to continue."*
+8. *"Scent ticks tell awareness whether it is still oriented correctly."*
+9. *"We refresh self and now so fast that reflection only needs to carry motion, not meaning."*
 
-## Clock Domains
-
-```
-HOT     →  Now/Self/Projected → grammar delta (inline)
-COLD    →  bframes → reflection → arbiter (QStash)
-STREAM  →  SSE Markov chains (parallel)
-```
-
-## Trust Tiers
+## Sacred Rules
 
 ```
-UNTRUSTED → (3 occ, 2 sessions, 2 models) → CANDIDATE → arbiter → TRUSTED
-                                                              ↓
-                                                        DISFAVORED (repeated rejection)
+1. I-frames define truth. B-frames suggest.
+2. Scent biases, never defines.
+3. Refresh faster than drift.
+4. HOT events never go through QStash.
+5. Grammar version is monotonic and atomic.
 ```
 
 ## Quick Start
 
 ```bash
-# Health
 curl https://mcp.exo.red/health
-
-# OAuth discovery
 curl https://mcp.exo.red/.well-known/openid-configuration
 
-# MCP tools
 curl -X POST https://mcp.exo.red/mcp/message \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-
-# Streaming invoke
-curl -X POST https://mcp.exo.red/invoke \
-  -H "Content-Type: application/json" \
-  -d '{"tool":"vector_markov","args":{"seed":"test","steps":10},"stream":true}'
-```
-
-## Requirements
-
-```
-starlette
-uvicorn[standard]
-httpx
-python-multipart
 ```
