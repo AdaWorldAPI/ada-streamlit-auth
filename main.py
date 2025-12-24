@@ -70,10 +70,17 @@ OPENID_CONFIG = {
     "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]
 }
 
+
 async def wellknown_openid(request):
     return JSONResponse(OPENID_CONFIG)
 
-def render_auth_page(client_id, redirect_uri, state, code_challenge, code_challenge_method, scope):
+async def wellknown_protected_resource(request):
+    return JSONResponse({
+        "resource": f"{BASE_URL}/mcp/sse",
+        "authorization_servers": [BASE_URL],
+        "scopes_supported": ["mcp", "claudeai", "full"],
+        "bearer_methods_supported": ["header"]
+    })
     """Render auth page - avoids .format() CSS brace issues"""
     return f'''<!DOCTYPE html>
 <html><head><title>Ada Authorization</title>
@@ -97,6 +104,7 @@ button{{padding:.8em 2em;margin:.5em;border:none;border-radius:.5em;cursor:point
 <input type="hidden" name="code_challenge" value="{code_challenge}">
 <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
 <input type="hidden" name="scope" value="{scope}">
+<input type="hidden" name="resource" value="{resource}">
 <input type="password" name="scent" placeholder="Enter scent..." required>
 <div>
 <button type="submit" name="action" value="approve" class="approve">Authorize</button>
@@ -114,7 +122,8 @@ async def authorize(request):
             state=p.get("state", ""),
             code_challenge=p.get("code_challenge", ""),
             code_challenge_method=p.get("code_challenge_method", "S256"),
-            scope=p.get("scope", "mcp")
+            scope=p.get("scope", "mcp"),
+            resource=p.get("resource", "")
         )
         return HTMLResponse(html)
     
@@ -136,6 +145,7 @@ async def authorize(request):
         "scope": form.get("scope", "mcp"),
         "user_id": user_id,
         "code_challenge": form.get("code_challenge"),
+        "resource": form.get("resource", ""),
         "code_challenge_method": form.get("code_challenge_method", "S256")
     }), "EX", "600")
     
@@ -524,6 +534,8 @@ app = Starlette(
         Route("/", index),
         Route("/health", health),
         Route("/.well-known/openid-configuration", wellknown_openid),
+        Route("/.well-known/oauth-protected-resource", wellknown_protected_resource),
+        Route("/.well-known/oauth-authorization-server", wellknown_openid),
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
         Route("/mcp/sse", mcp_sse),
