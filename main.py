@@ -396,6 +396,7 @@ app = Starlette(
         Route("/invoke", invoke, methods=["POST"]),
         Route("/invoke/{id}", invoke_stream, methods=["GET"]),
         Route("/invoke/{id}", invoke_cancel, methods=["DELETE"]),
+        Route("/bframe/process", bframe_process, methods=["POST"]),
     ],
     middleware=[Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])]
 )
@@ -403,3 +404,69 @@ app = Starlette(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+# ═══════════════════════════════════════════════════════════════════
+# BFRAME PROCESSOR (QStash callback - cold path)
+# ═══════════════════════════════════════════════════════════════════
+async def bframe_process(request):
+    """
+    QStash delivers batched bframes here
+    This is the cold path - reflection, not action
+    """
+    body = await request.json()
+    
+    # Verify QStash signature in production
+    # signature = request.headers.get("Upstash-Signature")
+    
+    bframe = body
+    pattern_hash = hashlib.sha256(json.dumps(bframe.get("content", {}), sort_keys=True).encode()).hexdigest()[:16]
+    
+    # Update pattern stats
+    stats_key = f"ada:bframe:pattern:{pattern_hash}"
+    existing = await redis_cmd("GET", stats_key)
+    
+    if existing:
+        stats = json.loads(existing)
+        stats["occurrences"] = stats.get("occurrences", 0) + 1
+        stats["sessions"] = list(set(stats.get("sessions", []) + [bframe.get("session_id")]))
+        stats["models"] = list(set(stats.get("models", []) + [bframe.get("model_source")]))
+        stats["last_seen"] = time.time()
+    else:
+        stats = {
+            "pattern_hash": pattern_hash,
+            "pattern_type": bframe.get("pattern_type"),
+            "occurrences": 1,
+            "sessions": [bframe.get("session_id")],
+            "models": [bframe.get("model_source")],
+            "first_seen": time.time(),
+            "last_seen": time.time(),
+            "trust_level": "UNTRUSTED"
+        }
+    
+    await redis_cmd("SET", stats_key, json.dumps(stats), "EX", "86400")
+    
+    # Check promotion threshold
+    min_occ, min_sess, min_mod = 3, 2, 2
+    should_promote = (
+        stats["occurrences"] >= min_occ and
+        len(stats["sessions"]) >= min_sess and
+        len(stats["models"]) >= min_mod
+    )
+    
+    if should_promote and stats["trust_level"] == "UNTRUSTED":
+        stats["trust_level"] = "CANDIDATE"
+        await redis_cmd("SET", stats_key, json.dumps(stats))
+        await redis_cmd("LPUSH", "ada:bframe:candidates", json.dumps({
+            "pattern_hash": pattern_hash,
+            "stats": stats,
+            "promoted_at": time.time()
+        }))
+    
+    return JSONResponse({
+        "processed": True,
+        "pattern_hash": pattern_hash,
+        "occurrences": stats["occurrences"],
+        "trust_level": stats["trust_level"],
+        "promoted": should_promote and stats["trust_level"] == "CANDIDATE"
+    })
+
