@@ -1,3 +1,4 @@
 starlette
 uvicorn[standard]
 httpx
+python-multipart
