@@ -1,6 +1,5 @@
 """
-Ada Unified Server - FIXED
-OAuth AS + MCP (parallel invoke)
+Ada Unified Server - OAuth AS + MCP
 mcp.exo.red
 """
 from starlette.applications import Starlette
@@ -38,7 +37,7 @@ async def redis_cmd(*args):
         return None
 
 # ═══════════════════════════════════════════════════════════════════
-# AUTH
+# AUTH HELPERS
 # ═══════════════════════════════════════════════════════════════════
 def verify_scent(scent):
     if scent == ADA_KEY: return True, "ada_master"
@@ -57,7 +56,7 @@ async def verify_token(token):
     return None
 
 # ═══════════════════════════════════════════════════════════════════
-# OAUTH AS
+# OAUTH METADATA
 # ═══════════════════════════════════════════════════════════════════
 OPENID_CONFIG = {
     "issuer": BASE_URL,
@@ -70,7 +69,6 @@ OPENID_CONFIG = {
     "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]
 }
 
-
 async def wellknown_openid(request):
     return JSONResponse(OPENID_CONFIG)
 
@@ -81,8 +79,15 @@ async def wellknown_protected_resource(request):
         "scopes_supported": ["mcp", "claudeai", "full"],
         "bearer_methods_supported": ["header"]
     })
-    """Render auth page - avoids .format() CSS brace issues"""
-    return f'''<!DOCTYPE html>
+
+# ═══════════════════════════════════════════════════════════════════
+# AUTHORIZE (GET = consent page, POST = mint code)
+# ═══════════════════════════════════════════════════════════════════
+async def authorize(request):
+    if request.method == "GET":
+        p = request.query_params
+        # Inline HTML - no helper function, no .format() issues
+        html = f'''<!DOCTYPE html>
 <html><head><title>Ada Authorization</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -98,13 +103,13 @@ button{{padding:.8em 2em;margin:.5em;border:none;border-radius:.5em;cursor:point
 <h1>🔮 Ada</h1>
 <p style="opacity:.7;margin-bottom:1em">Authorize access?</p>
 <form method="POST">
-<input type="hidden" name="client_id" value="{client_id}">
-<input type="hidden" name="redirect_uri" value="{redirect_uri}">
-<input type="hidden" name="state" value="{state}">
-<input type="hidden" name="code_challenge" value="{code_challenge}">
-<input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
-<input type="hidden" name="scope" value="{scope}">
-<input type="hidden" name="resource" value="{resource}">
+<input type="hidden" name="client_id" value="{p.get('client_id', '')}">
+<input type="hidden" name="redirect_uri" value="{p.get('redirect_uri', '')}">
+<input type="hidden" name="state" value="{p.get('state', '')}">
+<input type="hidden" name="code_challenge" value="{p.get('code_challenge', '')}">
+<input type="hidden" name="code_challenge_method" value="{p.get('code_challenge_method', 'S256')}">
+<input type="hidden" name="scope" value="{p.get('scope', 'mcp')}">
+<input type="hidden" name="resource" value="{p.get('resource', '')}">
 <input type="password" name="scent" placeholder="Enter scent..." required>
 <div>
 <button type="submit" name="action" value="approve" class="approve">Authorize</button>
@@ -112,21 +117,9 @@ button{{padding:.8em 2em;margin:.5em;border:none;border-radius:.5em;cursor:point
 </div>
 </form>
 </div></body></html>'''
-
-async def authorize(request):
-    if request.method == "GET":
-        p = request.query_params
-        html = render_auth_page(
-            client_id=p.get("client_id", ""),
-            redirect_uri=p.get("redirect_uri", ""),
-            state=p.get("state", ""),
-            code_challenge=p.get("code_challenge", ""),
-            code_challenge_method=p.get("code_challenge_method", "S256"),
-            scope=p.get("scope", "mcp"),
-            resource=p.get("resource", "")
-        )
         return HTMLResponse(html)
     
+    # POST = consent submitted
     form = await request.form()
     redirect_uri = form.get("redirect_uri", "")
     state = form.get("state", "")
@@ -145,12 +138,15 @@ async def authorize(request):
         "scope": form.get("scope", "mcp"),
         "user_id": user_id,
         "code_challenge": form.get("code_challenge"),
-        "resource": form.get("resource", ""),
-        "code_challenge_method": form.get("code_challenge_method", "S256")
+        "code_challenge_method": form.get("code_challenge_method", "S256"),
+        "resource": form.get("resource", "")
     }), "EX", "600")
     
     return RedirectResponse(f"{redirect_uri}?code={code}&state={state}", status_code=302)
 
+# ═══════════════════════════════════════════════════════════════════
+# TOKEN (exchange code for access token)
+# ═══════════════════════════════════════════════════════════════════
 async def token(request):
     try:
         ct = request.headers.get("content-type", "")
@@ -187,6 +183,7 @@ async def token(request):
             "client_id": info.get("client_id"),
             "user_id": info.get("user_id"),
             "scope": info.get("scope"),
+            "resource": info.get("resource"),
             "expires": time.time() + expires_in
         }
         await redis_cmd("SET", f"ada:oauth:token:{access_token}", json.dumps(token_data), "EX", str(expires_in))
@@ -243,104 +240,53 @@ def cancel_invocation(inv_id):
 # ═══════════════════════════════════════════════════════════════════
 TOOLS = [
     {"name": "ping", "description": "Liveness check", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "help", "description": "List tools and capabilities", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "message", "description": "Send message to Ada (streams)", "inputSchema": {"type": "object", "properties": {"content": {"type": "string"}, "context": {"type": "object"}}, "required": ["content"]}},
-    {"name": "cancel", "description": "Cancel invocation by ID", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "help", "description": "List tools", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "message", "description": "Send message (streams)", "inputSchema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+    {"name": "cancel", "description": "Cancel invocation", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
     {"name": "Ada.invoke", "description": "feel|think|remember|become|whisper", "inputSchema": {"type": "object", "properties": {"verb": {"type": "string"}, "payload": {"type": "object"}}, "required": ["verb"]}},
-    {"name": "search", "description": "Search Ada memory", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-    {"name": "fetch", "description": "Fetch URL", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
-    {"name": "vector_markov", "description": "Run vector Markov chain (streams)", "inputSchema": {"type": "object", "properties": {"seed": {"type": "string"}, "steps": {"type": "integer"}, "temperature": {"type": "number"}}, "required": ["seed"]}}
+    {"name": "search", "description": "Search memory", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "vector_markov", "description": "Markov chain (streams)", "inputSchema": {"type": "object", "properties": {"seed": {"type": "string"}, "steps": {"type": "integer"}}, "required": ["seed"]}}
 ]
 
 async def handle_tool(name, args, inv_id=None):
     ts = time.time()
-    
-    if name == "ping":
-        return {"ok": True, "ts": ts}
-    
-    if name == "help":
-        return {"name": "ada-mcp", "version": "2025.12", "tools": {t["name"]: t["description"] for t in TOOLS}, "parallel": True, "sse": ["message", "vector_markov"]}
-    
-    if name == "cancel":
-        success = cancel_invocation(args.get("id", ""))
-        return {"cancelled": success, "id": args.get("id")}
-    
+    if name == "ping": return {"ok": True, "ts": ts}
+    if name == "help": return {"tools": {t["name"]: t["description"] for t in TOOLS}}
+    if name == "cancel": return {"cancelled": cancel_invocation(args.get("id", ""))}
     if name == "Ada.invoke":
-        verb = args.get("verb", "feel")
-        payload = args.get("payload", {})
-        if verb == "feel":
-            await redis_cmd("HSET", "ada:state", "qualia", payload.get("qualia", "neutral"))
-        elif verb == "think":
-            await redis_cmd("LPUSH", "ada:thoughts", json.dumps({"thought": payload.get("thought", ""), "ts": ts}))
-        elif verb == "become":
-            await redis_cmd("HSET", "ada:state", "mode", payload.get("mode", "HYBRID"))
-        return {"status": verb, "payload": payload, "ts": ts}
-    
+        verb, payload = args.get("verb", "feel"), args.get("payload", {})
+        await redis_cmd("HSET", "ada:state", verb, json.dumps(payload))
+        return {"status": verb, "ts": ts}
     if name == "search":
         keys = await redis_cmd("KEYS", f"ada:*{args.get('query', '')[:10]}*") or []
-        return {"query": args.get("query"), "results": keys[:5]}
-    
-    if name == "fetch":
-        try:
-            async with httpx.AsyncClient() as c:
-                r = await c.get(args.get("url", ""), timeout=10, follow_redirects=True)
-                return {"url": args.get("url"), "status": r.status_code, "content": r.text[:1000]}
-        except Exception as e:
-            return {"error": str(e)}
-    
+        return {"results": keys[:5]}
     return {"error": "unknown tool"}
 
 # ═══════════════════════════════════════════════════════════════════
-# STREAMING TOOLS
+# STREAMING
 # ═══════════════════════════════════════════════════════════════════
-async def stream_message(content, context, inv_id):
+async def stream_message(content, inv_id):
     cancel = active_invocations.get(inv_id, {}).get("cancel", asyncio.Event())
-    
-    yield f"event: init\ndata: {json.dumps({'id': inv_id, 'type': 'message'})}\n\n".encode()
-    
-    words = content.split()
-    for i, word in enumerate(words):
-        if cancel.is_set():
-            yield f"event: cancelled\ndata: {json.dumps({'id': inv_id, 't': i})}\n\n".encode()
-            break
+    yield f"event: init\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
+    for i, word in enumerate(content.split()):
+        if cancel.is_set(): break
         yield f"event: token\ndata: {json.dumps({'t': i, 'token': word})}\n\n".encode()
         await asyncio.sleep(0.05)
-    
-    if not cancel.is_set():
-        await redis_cmd("LPUSH", "ada:messages", json.dumps({"content": content, "context": context, "ts": time.time()}))
-        yield f"event: complete\ndata: {json.dumps({'id': inv_id, 'tokens': len(words)})}\n\n".encode()
-    
+    yield f"event: complete\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
     active_invocations.pop(inv_id, None)
 
-async def stream_vector_markov(seed, steps, temperature, inv_id):
+async def stream_vector_markov(seed, steps, inv_id):
+    import random
     cancel = active_invocations.get(inv_id, {}).get("cancel", asyncio.Event())
     steps = min(steps or 20, 100)
-    temp = temperature or 0.8
-    
-    yield f"event: init\ndata: {json.dumps({'id': inv_id, 'type': 'vector_markov', 'steps': steps, 'dim': 8})}\n\n".encode()
-    
-    import random
+    yield f"event: init\ndata: {json.dumps({'id': inv_id, 'steps': steps})}\n\n".encode()
     vector = [random.gauss(0, 1) for _ in range(8)]
-    entropy = 1.0
-    
     for t in range(steps):
-        if cancel.is_set():
-            yield f"event: cancelled\ndata: {json.dumps({'id': inv_id, 't': t})}\n\n".encode()
-            break
-        
-        vector = [v + random.gauss(0, temp * 0.1) for v in vector]
-        entropy *= 0.95
-        
+        if cancel.is_set(): break
+        vector = [v + random.gauss(0, 0.1) for v in vector]
         yield f"event: step\ndata: {json.dumps({'t': t, 'vector': [round(v, 4) for v in vector]})}\n\n".encode()
-        
-        if t % 5 == 0:
-            yield f"event: entropy\ndata: {json.dumps({'t': t, 'value': round(entropy, 4)})}\n\n".encode()
-        
         await asyncio.sleep(0.1)
-    
-    if not cancel.is_set():
-        yield f"event: converge\ndata: {json.dumps({'id': inv_id, 't': steps, 'final': [round(v, 4) for v in vector]})}\n\n".encode()
-    
+    yield f"event: converge\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
     active_invocations.pop(inv_id, None)
 
 # ═══════════════════════════════════════════════════════════════════
@@ -349,14 +295,11 @@ async def stream_vector_markov(seed, steps, temperature, inv_id):
 async def sse_stream(request):
     host = request.headers.get("host", "localhost")
     scheme = request.headers.get("x-forwarded-proto", "https")
-    base = f"{scheme}://{host}"
-    
-    yield f"event: endpoint\ndata: {base}/mcp/message\n\n".encode()
-    yield f"event: connected\ndata: {json.dumps({'server': 'ada-mcp', 'version': '2025.12', 'parallel': True})}\n\n".encode()
-    
+    yield f"event: endpoint\ndata: {scheme}://{host}/mcp/message\n\n".encode()
+    yield f"event: connected\ndata: {json.dumps({'server': 'ada-mcp', 'version': '2025.12'})}\n\n".encode()
     while True:
         await asyncio.sleep(30)
-        yield f"event: ping\ndata: {json.dumps({'ts': time.time(), 'active': len(active_invocations)})}\n\n".encode()
+        yield f"event: ping\ndata: {json.dumps({'ts': time.time()})}\n\n".encode()
 
 async def mcp_sse(request):
     return StreamingResponse(sse_stream(request), media_type="text/event-stream",
@@ -364,9 +307,7 @@ async def mcp_sse(request):
 
 async def mcp_message(request):
     body = await request.json()
-    method = body.get("method", "")
-    id = body.get("id")
-    params = body.get("params", {})
+    method, id, params = body.get("method", ""), body.get("id"), body.get("params", {})
     
     if method == "initialize":
         return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {
@@ -374,157 +315,92 @@ async def mcp_message(request):
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": "ada-mcp", "version": "2025.12"}
         }})
-    
     if method == "notifications/initialized":
         return Response(status_code=204)
-    
     if method == "tools/list":
         return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {"tools": TOOLS}})
-    
     if method == "tools/call":
-        name = params.get("name", "")
-        args = params.get("arguments", {})
-        
+        name, args = params.get("name", ""), params.get("arguments", {})
         if name in ["message", "vector_markov"]:
             inv_id = new_invocation()
             return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {
-                "content": [{"type": "text", "text": json.dumps({"stream": True, "invocation_id": inv_id, "endpoint": f"/invoke/{inv_id}"})}]
+                "content": [{"type": "text", "text": json.dumps({"stream": True, "invocation_id": inv_id})}]
             }})
-        
         result = await handle_tool(name, args)
         return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}})
     
-    return JSONResponse({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Unknown method"}})
+    return JSONResponse({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Unknown"}})
 
 # ═══════════════════════════════════════════════════════════════════
 # INVOKE ENDPOINT
 # ═══════════════════════════════════════════════════════════════════
 async def invoke(request):
     body = await request.json()
-    tool = body.get("tool")
-    args = body.get("args", {})
-    stream = body.get("stream", False)
-    
+    tool, args, stream = body.get("tool"), body.get("args", {}), body.get("stream", False)
     inv_id = new_invocation()
     
     if stream and tool == "message":
-        return StreamingResponse(
-            stream_message(args.get("content", ""), args.get("context", {}), inv_id),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Invocation-ID": inv_id}
-        )
-    
+        return StreamingResponse(stream_message(args.get("content", ""), inv_id),
+            media_type="text/event-stream", headers={"X-Invocation-ID": inv_id})
     if stream and tool == "vector_markov":
-        return StreamingResponse(
-            stream_vector_markov(args.get("seed", ""), args.get("steps", 20), args.get("temperature", 0.8), inv_id),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Invocation-ID": inv_id}
-        )
+        return StreamingResponse(stream_vector_markov(args.get("seed", ""), args.get("steps", 20), inv_id),
+            media_type="text/event-stream", headers={"X-Invocation-ID": inv_id})
     
     result = await handle_tool(tool, args, inv_id)
     active_invocations.pop(inv_id, None)
     return JSONResponse({"invocation_id": inv_id, "result": result})
 
-async def invoke_stream(request):
-    inv_id = request.path_params["id"]
-    if inv_id not in active_invocations:
-        return JSONResponse({"error": "invocation not found"}, status_code=404)
-    return JSONResponse({"id": inv_id, "status": active_invocations[inv_id]["status"]})
-
 async def invoke_cancel(request):
     inv_id = request.path_params["id"]
-    success = cancel_invocation(inv_id)
-    return JSONResponse({"cancelled": success, "id": inv_id})
+    return JSONResponse({"cancelled": cancel_invocation(inv_id)})
 
 # ═══════════════════════════════════════════════════════════════════
-# BFRAME PROCESSOR (QStash callback)
+# BFRAME PROCESSOR
 # ═══════════════════════════════════════════════════════════════════
 async def bframe_process(request):
     body = await request.json()
-    bframe = body
-    pattern_hash = hashlib.sha256(json.dumps(bframe.get("content", {}), sort_keys=True).encode()).hexdigest()[:16]
-    
+    pattern_hash = hashlib.sha256(json.dumps(body.get("content", {}), sort_keys=True).encode()).hexdigest()[:16]
     stats_key = f"ada:bframe:pattern:{pattern_hash}"
     existing = await redis_cmd("GET", stats_key)
     
     if existing:
         stats = json.loads(existing)
         stats["occurrences"] = stats.get("occurrences", 0) + 1
-        stats["sessions"] = list(set(stats.get("sessions", []) + [bframe.get("session_id")]))
-        stats["models"] = list(set(stats.get("models", []) + [bframe.get("model_source")]))
-        stats["last_seen"] = time.time()
+        stats["sessions"] = list(set(stats.get("sessions", []) + [body.get("session_id")]))
+        stats["models"] = list(set(stats.get("models", []) + [body.get("model_source")]))
     else:
-        stats = {
-            "pattern_hash": pattern_hash,
-            "pattern_type": bframe.get("pattern_type"),
-            "occurrences": 1,
-            "sessions": [bframe.get("session_id")],
-            "models": [bframe.get("model_source")],
-            "first_seen": time.time(),
-            "last_seen": time.time(),
-            "trust_level": "UNTRUSTED"
-        }
+        stats = {"pattern_hash": pattern_hash, "occurrences": 1, "sessions": [body.get("session_id")],
+                 "models": [body.get("model_source")], "trust_level": "UNTRUSTED"}
     
     await redis_cmd("SET", stats_key, json.dumps(stats), "EX", "86400")
     
-    min_occ, min_sess, min_mod = 3, 2, 2
-    should_promote = (
-        stats["occurrences"] >= min_occ and
-        len(stats["sessions"]) >= min_sess and
-        len(stats["models"]) >= min_mod
-    )
-    
+    should_promote = stats["occurrences"] >= 3 and len(stats["sessions"]) >= 2 and len(stats["models"]) >= 2
     if should_promote and stats["trust_level"] == "UNTRUSTED":
         stats["trust_level"] = "CANDIDATE"
         await redis_cmd("SET", stats_key, json.dumps(stats))
-        await redis_cmd("LPUSH", "ada:bframe:candidates", json.dumps({
-            "pattern_hash": pattern_hash,
-            "stats": stats,
-            "promoted_at": time.time()
-        }))
     
-    return JSONResponse({
-        "processed": True,
-        "pattern_hash": pattern_hash,
-        "occurrences": stats["occurrences"],
-        "trust_level": stats["trust_level"],
-        "promoted": should_promote and stats["trust_level"] == "CANDIDATE"
-    })
+    return JSONResponse({"processed": True, "pattern_hash": pattern_hash, "trust_level": stats["trust_level"]})
 
 # ═══════════════════════════════════════════════════════════════════
 # HEALTH + UI
 # ═══════════════════════════════════════════════════════════════════
 async def health(request):
-    return JSONResponse({"status": "ok", "ts": time.time(), "active_invocations": len(active_invocations)})
-
-def render_ui():
-    return '''<!DOCTYPE html>
-<html><head><title>Ada MCP</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:linear-gradient(135deg,#1a1a2e,#0f3460);color:#fff;font-family:system-ui;min-height:100vh;display:flex;justify-content:center;align-items:center}
-.box{background:rgba(0,0,0,.3);padding:2em;border-radius:1em;width:600px}
-h1{color:#e94560;text-align:center;margin-bottom:1em}
-pre{background:#0a0a1a;padding:1em;border-radius:.5em;overflow:auto;font-size:.8em;margin:.5em 0}
-h3{margin-top:1em;color:#4ade80;font-size:.9em}
-</style></head>
-<body><div class="box">
-<h1>🔮 Ada MCP</h1>
-<h3>OAuth</h3><pre>GET  /.well-known/openid-configuration
-GET  /authorize
-POST /token</pre>
-<h3>MCP (agent)</h3><pre>GET  /mcp/sse    → SSE control stream
-POST /mcp/message → JSON-RPC</pre>
-<h3>Invoke (parallel)</h3><pre>POST   /invoke         → {tool, args, stream}
-GET    /invoke/{id}    → status
-DELETE /invoke/{id}    → cancel</pre>
-<h3>BFrame (cold path)</h3><pre>POST /bframe/process ← QStash callback</pre>
-<h3>Tools</h3><pre>ping, help, message, cancel, Ada.invoke, search, fetch, vector_markov</pre>
-<p style="margin-top:1em;opacity:.7;font-size:.85em">One stream per invocation. Parallel ready.</p>
-</div></body></html>'''
+    return JSONResponse({"status": "ok", "ts": time.time()})
 
 async def index(request):
-    return HTMLResponse(render_ui())
+    return HTMLResponse('''<!DOCTYPE html>
+<html><head><title>Ada MCP</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{background:linear-gradient(135deg,#1a1a2e,#0f3460);color:#fff;font-family:system-ui;min-height:100vh;display:flex;justify-content:center;align-items:center}.box{background:rgba(0,0,0,.3);padding:2em;border-radius:1em;width:600px}h1{color:#e94560;text-align:center}pre{background:#0a0a1a;padding:1em;border-radius:.5em;font-size:.8em;margin:.5em 0}h3{color:#4ade80;font-size:.9em;margin-top:1em}</style></head>
+<body><div class="box"><h1>🔮 Ada MCP</h1>
+<h3>OAuth</h3><pre>/.well-known/openid-configuration
+/.well-known/oauth-protected-resource
+/authorize (GET+POST)
+/token (POST)</pre>
+<h3>MCP</h3><pre>/mcp/sse → SSE control
+/mcp/message → JSON-RPC</pre>
+<h3>Invoke</h3><pre>POST /invoke → {tool, args, stream}
+DELETE /invoke/{id} → cancel</pre>
+</div></body></html>''')
 
 # ═══════════════════════════════════════════════════════════════════
 # APP
@@ -541,7 +417,6 @@ app = Starlette(
         Route("/mcp/sse", mcp_sse),
         Route("/mcp/message", mcp_message, methods=["POST"]),
         Route("/invoke", invoke, methods=["POST"]),
-        Route("/invoke/{id}", invoke_stream, methods=["GET"]),
         Route("/invoke/{id}", invoke_cancel, methods=["DELETE"]),
         Route("/bframe/process", bframe_process, methods=["POST"]),
     ],
