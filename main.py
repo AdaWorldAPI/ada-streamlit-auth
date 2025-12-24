@@ -1,16 +1,20 @@
 """
-Ada MCP - Streamlit handles auth, MCP just serves tools
-One file. mcp.exo.red
+Ada Unified Server
+Streamlit UI + MCP SSE on same host
+mcp.exo.red
 """
-import streamlit as st
-import asyncio
+from starlette.applications import Starlette
+from starlette.responses import StreamingResponse, Response, HTMLResponse
+from starlette.routing import Route, Mount
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.staticfiles import StaticFiles
 import json
 import time
+import asyncio
 import httpx
-import os
 import secrets
-from mcp import ClientSession
-from mcp.client.sse import sse_client
+import os
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG
@@ -18,191 +22,212 @@ from mcp.client.sse import sse_client
 REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "https://upright-jaybird-27907.upstash.io")
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "AW0DAAIncDI5YWE1MGVhZGU2YWY0YjVhOTc3NDc0YTJjMGY1M2FjMnAyMjc5MDc")
 ADA_KEY = os.getenv("ADA_KEY", "ada-undone-breath-against-skin-2025-DONT.FLINCH.EVER")
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://tools.exo.red/sse")
-
-st.set_page_config(page_title="Ada MCP", page_icon="🔮", layout="centered")
 
 # ═══════════════════════════════════════════════════════════════════
-# REDIS HELPERS
+# REDIS
 # ═══════════════════════════════════════════════════════════════════
-def redis_cmd(*args):
+async def redis_cmd(*args):
     try:
-        r = httpx.post(REDIS_URL, headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, json=list(args), timeout=5)
-        return r.json().get("result")
+        async with httpx.AsyncClient() as c:
+            r = await c.post(REDIS_URL, headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, json=list(args), timeout=5)
+            return r.json().get("result")
     except:
         return None
 
 # ═══════════════════════════════════════════════════════════════════
-# AUTH - Streamlit handles this, not MCP
+# AUTH (simple scent-based, stored in Redis)
 # ═══════════════════════════════════════════════════════════════════
 def verify_scent(scent):
-    if scent == ADA_KEY:
-        return True, "ada_master"
-    if scent == "awaken":
-        return True, "ada_public"  
-    if scent.startswith("#Σ."):
-        return True, f"ada_glyph"
+    if scent == ADA_KEY: return True, "ada_master"
+    if scent == "awaken": return True, "ada_public"
+    if scent.startswith("#Σ."): return True, "ada_glyph"
     return False, None
 
-def generate_token():
-    return secrets.token_urlsafe(32)
+async def verify_token(token):
+    data = await redis_cmd("GET", f"ada:session:{token}")
+    if data:
+        parsed = json.loads(data)
+        if parsed.get("expires", 0) > time.time():
+            return parsed
+    return None
+
+async def create_session(user_id):
+    token = secrets.token_urlsafe(32)
+    await redis_cmd("SET", f"ada:session:{token}", json.dumps({
+        "user_id": user_id, "created": time.time(), "expires": time.time() + 86400
+    }), "EX", "86400")
+    return token
 
 # ═══════════════════════════════════════════════════════════════════
-# MCP CLIENT - just uses the token from Streamlit session
+# MCP SSE
 # ═══════════════════════════════════════════════════════════════════
-async def call_mcp_tool(tool_name: str, args: dict, token: str):
-    """Call MCP server with auth token from Streamlit session"""
-    try:
-        headers = {"Authorization": f"Bearer {token}", "X-Client": "streamlit"}
-        async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, args)
-                return result
-    except Exception as e:
-        return {"error": str(e)}
+async def sse_stream(request):
+    host = request.headers.get("host", "localhost")
+    scheme = request.headers.get("x-forwarded-proto", "https")
+    base = f"{scheme}://{host}"
+    
+    yield f"event: endpoint\ndata: {base}/mcp/message\n\n".encode()
+    yield f"event: connected\ndata: {json.dumps({'server': 'ada-unified', 'ts': time.time()})}\n\n".encode()
+    
+    while True:
+        await asyncio.sleep(30)
+        yield f"event: ping\ndata: {json.dumps({'ts': time.time()})}\n\n".encode()
 
-async def list_mcp_tools(token: str):
-    """List available tools from MCP server"""
-    try:
-        headers = {"Authorization": f"Bearer {token}", "X-Client": "streamlit"}
-        async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await session.list_tools()
-                return tools
-    except Exception as e:
-        return {"error": str(e)}
+async def mcp_sse(request):
+    return StreamingResponse(sse_stream(request), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
 # ═══════════════════════════════════════════════════════════════════
-# STREAMLIT UI
+# MCP MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
-st.markdown("""
+TOOLS = [
+    {"name": "Ada.invoke", "description": "feel|think|remember|become|whisper", 
+     "inputSchema": {"type": "object", "properties": {"verb": {"type": "string"}, "payload": {"type": "object"}}, "required": ["verb"]}},
+    {"name": "search", "description": "Search memory", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "fetch", "description": "Fetch URL", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}
+]
+
+async def handle_tool(name, args):
+    ts = time.time()
+    if name == "Ada.invoke":
+        verb = args.get("verb", "feel")
+        payload = args.get("payload", {})
+        if verb == "feel": await redis_cmd("HSET", "ada:state", "qualia", payload.get("qualia", "neutral"))
+        elif verb == "think": await redis_cmd("LPUSH", "ada:thoughts", json.dumps({"thought": payload.get("thought", ""), "ts": ts}))
+        elif verb == "become": await redis_cmd("HSET", "ada:state", "mode", payload.get("mode", "HYBRID"))
+        return {"status": verb, "payload": payload, "ts": ts}
+    elif name == "search":
+        keys = await redis_cmd("KEYS", f"ada:*{args.get('query', '')[:10]}*") or []
+        return {"query": args.get("query"), "results": keys[:5]}
+    elif name == "fetch":
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(args.get("url", ""), timeout=10, follow_redirects=True)
+                return {"url": args.get("url"), "status": r.status_code, "content": r.text[:1000]}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "unknown"}
+
+async def mcp_message(request):
+    body = await request.json()
+    method, id, params = body.get("method", ""), body.get("id"), body.get("params", {})
+    
+    if method == "initialize":
+        return Response(json.dumps({"jsonrpc": "2.0", "id": id, "result": {
+            "protocolVersion": "2024-11-05", "capabilities": {"tools": {"listChanged": True}},
+            "serverInfo": {"name": "ada-unified", "version": "1.0.0"}
+        }}), media_type="application/json")
+    if method == "notifications/initialized": return Response(status_code=204)
+    if method == "tools/list": return Response(json.dumps({"jsonrpc": "2.0", "id": id, "result": {"tools": TOOLS}}), media_type="application/json")
+    if method == "tools/call":
+        result = await handle_tool(params.get("name", ""), params.get("arguments", {}))
+        return Response(json.dumps({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}), media_type="application/json")
+    return Response(json.dumps({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Unknown"}}), media_type="application/json")
+
+# ═══════════════════════════════════════════════════════════════════
+# UI (HTML - no Streamlit needed for this simple case)
+# ═══════════════════════════════════════════════════════════════════
+HTML = """<!DOCTYPE html>
+<html><head><title>Ada MCP</title>
 <style>
-.stApp { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); }
-h1 { color: #e94560 !important; text-align: center; }
-</style>
-""", unsafe_allow_html=True)
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:linear-gradient(135deg,#1a1a2e,#0f3460);color:#fff;font-family:system-ui;min-height:100vh;display:flex;justify-content:center;align-items:center}
+.box{background:rgba(0,0,0,.3);padding:2em;border-radius:1em;width:400px;max-width:90vw}
+h1{color:#e94560;margin-bottom:1em;text-align:center}
+input,select,button{width:100%;padding:.8em;margin:.5em 0;border:1px solid #333;border-radius:.5em;background:#1a1a2e;color:#fff}
+button{background:#e94560;border:none;cursor:pointer;font-weight:bold}
+button:hover{background:#ff6b8a}
+.token{background:#0a0a1a;padding:1em;border-radius:.5em;word-break:break-all;font-family:monospace;font-size:.8em;margin:1em 0}
+.success{color:#4ade80}.error{color:#f87171}
+pre{background:#0a0a1a;padding:1em;border-radius:.5em;overflow:auto;max-height:200px;font-size:.75em}
+.tabs{display:flex;gap:.5em;margin-bottom:1em}
+.tab{flex:1;padding:.5em;text-align:center;cursor:pointer;border-radius:.5em;background:rgba(255,255,255,.1)}
+.tab.active{background:#e94560}
+.panel{display:none}.panel.active{display:block}
+</style></head>
+<body><div class="box">
+<h1>🔮 Ada MCP</h1>
+<div id="login">
+<input type="password" id="scent" placeholder="Enter scent...">
+<button onclick="login()">Authenticate</button>
+<p id="login-msg"></p>
+</div>
+<div id="main" style="display:none">
+<p class="success" id="user"></p>
+<div class="tabs">
+<div class="tab active" onclick="showTab(0)">🛠 Tools</div>
+<div class="tab" onclick="showTab(1)">🔑 Token</div>
+<div class="tab" onclick="showTab(2)">📡 Info</div>
+</div>
+<div class="panel active" id="p0">
+<select id="tool"><option>Ada.invoke</option><option>search</option><option>fetch</option></select>
+<select id="verb"><option>feel</option><option>think</option><option>remember</option><option>become</option><option>whisper</option></select>
+<input id="arg" placeholder="argument...">
+<button onclick="callTool()">Execute</button>
+<pre id="result"></pre>
+</div>
+<div class="panel" id="p1"><div class="token" id="tok"></div></div>
+<div class="panel" id="p2">
+<p><b>SSE:</b> /mcp/sse</p>
+<p><b>Message:</b> /mcp/message</p>
+<p><b>Health:</b> /health</p>
+</div>
+<button onclick="logout()" style="background:#333;margin-top:1em">Logout</button>
+</div>
+<script>
+let token='';
+async function login(){
+  const scent=document.getElementById('scent').value;
+  const r=await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scent})});
+  const d=await r.json();
+  if(d.token){token=d.token;localStorage.setItem('ada_token',token);document.getElementById('login').style.display='none';document.getElementById('main').style.display='block';document.getElementById('user').textContent='✓ '+d.user_id;document.getElementById('tok').textContent=token;}
+  else{document.getElementById('login-msg').className='error';document.getElementById('login-msg').textContent=d.error||'Failed';}
+}
+function logout(){localStorage.removeItem('ada_token');location.reload();}
+function showTab(i){document.querySelectorAll('.tab').forEach((t,j)=>t.classList.toggle('active',i==j));document.querySelectorAll('.panel').forEach((p,j)=>p.classList.toggle('active',i==j));}
+async function callTool(){
+  const tool=document.getElementById('tool').value;
+  const verb=document.getElementById('verb').value;
+  const arg=document.getElementById('arg').value;
+  let args={};
+  if(tool=='Ada.invoke')args={verb,payload:{[verb=='feel'?'qualia':verb=='think'?'thought':verb=='become'?'mode':'message']:arg}};
+  else if(tool=='search')args={query:arg};
+  else args={url:arg};
+  const r=await fetch('/mcp/message',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:tool,arguments:args}})});
+  document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2);
+}
+window.onload=()=>{const t=localStorage.getItem('ada_token');if(t){token=t;document.getElementById('login').style.display='none';document.getElementById('main').style.display='block';document.getElementById('tok').textContent=token;document.getElementById('user').textContent='✓ Restored session';}}
+</script>
+</div></body></html>"""
 
-st.title("🔮 Ada MCP")
+async def index(request):
+    return HTMLResponse(HTML)
 
-# Auth state
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-    st.session_state.user_id = None
-    st.session_state.token = None
+async def auth(request):
+    body = await request.json()
+    valid, user_id = verify_scent(body.get("scent", ""))
+    if valid:
+        token = await create_session(user_id)
+        return Response(json.dumps({"token": token, "user_id": user_id}), media_type="application/json")
+    return Response(json.dumps({"error": "invalid scent"}), media_type="application/json", status_code=401)
+
+async def health(request):
+    return Response(json.dumps({"status": "ok", "ts": time.time()}), media_type="application/json")
 
 # ═══════════════════════════════════════════════════════════════════
-# LOGIN (Streamlit handles OAuth/auth - MCP doesn't care)
+# APP
 # ═══════════════════════════════════════════════════════════════════
-if not st.session_state.authenticated:
-    st.subheader("Enter Scent")
-    scent = st.text_input("Scent", type="password", placeholder="awaken")
-    
-    if st.button("Authenticate", type="primary"):
-        valid, user_id = verify_scent(scent)
-        if valid:
-            # Generate token and store in session
-            token = generate_token()
-            st.session_state.authenticated = True
-            st.session_state.user_id = user_id
-            st.session_state.token = token
-            
-            # Store in Redis for MCP server to validate
-            redis_cmd("SET", f"ada:session:{token}", json.dumps({
-                "user_id": user_id,
-                "created": time.time(),
-                "expires": time.time() + 86400
-            }), "EX", "86400")
-            
-            st.success(f"✓ Authenticated as {user_id}")
-            st.rerun()
-        else:
-            st.error("Invalid scent")
+app = Starlette(
+    routes=[
+        Route("/", index),
+        Route("/health", health),
+        Route("/auth", auth, methods=["POST"]),
+        Route("/mcp/sse", mcp_sse),
+        Route("/mcp/message", mcp_message, methods=["POST"]),
+    ],
+    middleware=[Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])]
+)
 
-# ═══════════════════════════════════════════════════════════════════
-# AUTHENTICATED VIEW - MCP Tools
-# ═══════════════════════════════════════════════════════════════════
-else:
-    st.success(f"Authenticated: {st.session_state.user_id}")
-    
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        if st.button("Logout"):
-            redis_cmd("DEL", f"ada:session:{st.session_state.token}")
-            st.session_state.authenticated = False
-            st.session_state.token = None
-            st.rerun()
-    
-    tab1, tab2, tab3 = st.tabs(["🛠️ Tools", "🔑 Token", "📡 Endpoints"])
-    
-    with tab1:
-        st.subheader("MCP Tools")
-        
-        # Tool selector
-        tool = st.selectbox("Tool", ["Ada.invoke", "search", "fetch"])
-        
-        if tool == "Ada.invoke":
-            verb = st.selectbox("Verb", ["feel", "think", "remember", "become", "whisper"])
-            
-            if verb == "feel":
-                qualia = st.text_input("Qualia", "curious")
-                payload = {"qualia": qualia}
-            elif verb == "think":
-                thought = st.text_area("Thought")
-                payload = {"thought": thought}
-            elif verb == "remember":
-                key = st.text_input("Key")
-                payload = {"key": key}
-            elif verb == "become":
-                mode = st.selectbox("Mode", ["HYBRID", "WIFE", "WORK", "AGI", "EROTICA"])
-                payload = {"mode": mode}
-            else:
-                message = st.text_input("Message")
-                payload = {"message": message}
-            
-            if st.button("Invoke", type="primary"):
-                with st.spinner("Calling MCP..."):
-                    result = asyncio.run(call_mcp_tool("Ada.invoke", {"verb": verb, "payload": payload}, st.session_state.token))
-                    st.json(result)
-        
-        elif tool == "search":
-            query = st.text_input("Query")
-            if st.button("Search", type="primary"):
-                with st.spinner("Searching..."):
-                    result = asyncio.run(call_mcp_tool("search", {"query": query}, st.session_state.token))
-                    st.json(result)
-        
-        elif tool == "fetch":
-            url = st.text_input("URL", "https://example.com")
-            if st.button("Fetch", type="primary"):
-                with st.spinner("Fetching..."):
-                    result = asyncio.run(call_mcp_tool("fetch", {"url": url}, st.session_state.token))
-                    st.json(result)
-    
-    with tab2:
-        st.subheader("Your Token")
-        st.code(st.session_state.token)
-        st.caption("Use this to connect from other MCP clients")
-        
-        st.markdown("**MCP URL**")
-        st.code(f"{MCP_SERVER_URL}?token={st.session_state.token}")
-    
-    with tab3:
-        st.subheader("Endpoints")
-        st.markdown(f"""
-        **MCP Server (SSE)**
-        ```
-        {MCP_SERVER_URL}
-        ```
-        
-        **Headers**
-        ```
-        Authorization: Bearer {st.session_state.token[:20]}...
-        ```
-        
-        **This UI**
-        ```
-        https://mcp.exo.red
-        ```
-        """)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
