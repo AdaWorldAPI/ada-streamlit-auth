@@ -1,34 +1,37 @@
-# Ada MCP Server Documentation
+# Ada Architecture Documentation
 
-## The Codec Model
+## The Two Laws
 
-Awareness is a video stream, not a document.
-
-```
-I-frames  = Self + Now     (hot path, authoritative, fast refresh)
-P-frames  = Stream obs     (continuous, SSE)
-B-frames  = Scent ticks    (cold path, non-authoritative, batched)
-```
-
-**We're not compressing history. We're staying ahead of it.**
+1. **Claude starts NOW. Backend catches up.**
+2. **Writes fire-and-forget. Reads hit cache.**
 
 ## Architecture
 
 ```
-mcp.exo.red
-├── OAuth AS
-│   ├── /.well-known/*
-│   ├── /authorize
-│   └── /token
-├── MCP Protocol
-│   ├── /mcp/sse
-│   └── /mcp/message
-├── Invoke (parallel streams)
-│   ├── POST /invoke
-│   └── DELETE /invoke/{id}
-└── BFrame (cold path)
-    └── POST /bframe/process
+┌─────────────────────────────────────────────────────────────────┐
+│  CLAUDE SESSION                                                 │
+│  ═══════════════                                                │
+│  Fire async → QStash        Read cached → Redis                 │
+│  (don't wait)               (always fast)                       │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LANGGRAPH CLOUD (24/7)                                         │
+│  ══════════════════════                                         │
+│  Persist vectors │ Warm cache │ Route to Grok                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+## Codec Model
+
+```
+I-frames  = Self + Now      (hot path, authoritative)
+P-frames  = Stream obs      (continuous)
+B-frames  = Scent ticks     (cold path, non-authoritative)
+```
+
+**Refresh faster than drift.**
 
 ## Changelogs
 
@@ -40,10 +43,21 @@ mcp.exo.red
 | [04](./CHANGELOG_04_TROUBLESHOOTING.md) | Troubleshooting | OAuth works; the Python crashed. |
 | [05](./CHANGELOG_05_KALMAN_CLOCK_DOMAINS.md) | Kalman + Clock | Weight updates by trust + staleness. |
 | [06](./CHANGELOG_06_CODEC_MODEL.md) | Codec Model | Refresh faster than drift. |
+| [07](./CHANGELOG_07_ASYNC_FIRST.md) | Async-First | Claude starts NOW. Backend catches up. |
 
 ## Supplementary
 
 - [Unified Grammar DTO](./unified_grammar_dto.md) - Field mapping for Kalman filter
+
+## Implementation Files
+
+| File | Purpose |
+|------|---------|
+| `main.py` | OAuth AS + MCP server (mcp.exo.red) |
+| `neuralink_async.py` | Async-first client for Claude |
+| `langgraph_receiver.py` | 24/7 backend receiver |
+| `clock_domains.py` | Kalman-lite, arbiter, admission |
+| `qstash_bframe.py` | BFrame emission |
 
 ## Core Sentences
 
@@ -52,10 +66,11 @@ mcp.exo.red
 3. *"Vectors decorate structure, they don't define it."*
 4. *"No cold-path output may mutate hot-path state without passing the arbiter."*
 5. *"We didn't cheat compute. We avoided wasting it."*
-6. *"You're not forcing one timeline. You're weighting updates by trust + staleness."*
+6. *"You're not forcing one timeline. You're weighting by trust + staleness."*
 7. *"We don't predict the next scene. We protect the story's ability to continue."*
 8. *"Scent ticks tell awareness whether it is still oriented correctly."*
-9. *"We refresh self and now so fast that reflection only needs to carry motion, not meaning."*
+9. *"Refresh self and now so fast that reflection only needs motion, not meaning."*
+10. *"Claude starts NOW. Backend catches up."*
 
 ## Sacred Rules
 
@@ -63,17 +78,26 @@ mcp.exo.red
 1. I-frames define truth. B-frames suggest.
 2. Scent biases, never defines.
 3. Refresh faster than drift.
-4. HOT events never go through QStash.
+4. HOT events never go through QStash (only COLD).
 5. Grammar version is monotonic and atomic.
+6. Writes fire-and-forget. Reads hit cache.
+7. No MCP from Claude. REST only.
 ```
 
 ## Quick Start
 
-```bash
-curl https://mcp.exo.red/health
-curl https://mcp.exo.red/.well-known/openid-configuration
+```python
+from scripts.neuralink import ada
 
-curl -X POST https://mcp.exo.red/mcp/message \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+# Boot (fires async, returns immediately)
+await ada.boot(session_id)
+
+# Read (from cache, fast)
+persona = await ada.persona()
+qualia = await ada.qualia()
+
+# Write (fire-and-forget)
+await ada.now("current thought", {"presence": 0.95})
+await ada.bframe({"insight": "..."}, session_id)
+await ada.whisper("message to future self")
 ```
