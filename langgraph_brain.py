@@ -959,3 +959,144 @@ app = Starlette(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VECTOR HYGIENE INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Import vector hygiene functions
+try:
+    from vector_hygiene import (
+        persist_now_vector, persist_self_vector, persist_whisper_vector,
+        vector_query_hybrid, cleanup_all_vectors, full_rehydration_job,
+        find_vectors_without_sparse
+    )
+    VECTOR_HYGIENE_AVAILABLE = True
+except ImportError:
+    VECTOR_HYGIENE_AVAILABLE = False
+
+async def handle_vector_cleanup(request):
+    """Scheduled vector cleanup."""
+    if not VECTOR_HYGIENE_AVAILABLE:
+        return JSONResponse({"error": "vector_hygiene not available"})
+    
+    result = await cleanup_all_vectors()
+    return JSONResponse(result)
+
+async def handle_vector_rehydrate(request):
+    """Scheduled rehydration."""
+    if not VECTOR_HYGIENE_AVAILABLE:
+        return JSONResponse({"error": "vector_hygiene not available"})
+    
+    result = await full_rehydration_job()
+    return JSONResponse(result)
+
+async def handle_vector_query_endpoint(request):
+    """Query with hybrid fallback."""
+    if not VECTOR_HYGIENE_AVAILABLE:
+        return JSONResponse({"error": "vector_hygiene not available"})
+    
+    body = await request.json()
+    namespace = body.get("namespace", "self")
+    query = body.get("query", "")
+    top_k = body.get("top_k", 10)
+    
+    results = await vector_query_hybrid(namespace, query, top_k)
+    return JSONResponse({"results": results})
+
+async def handle_vector_stats(request):
+    """Get vector stats."""
+    if not VECTOR_HYGIENE_AVAILABLE:
+        return JSONResponse({"error": "vector_hygiene not available"})
+    
+    stats = {}
+    namespaces = ["driving-snipe", "tight-hog", "fine-kangaroo"]
+    for ns in namespaces:
+        missing = await find_vectors_without_sparse(ns)
+        keys = await cache_scan(f"ada:vector:{ns}:*")
+        stats[ns] = {
+            "total": len(keys),
+            "missing_sparse": len(missing)
+        }
+    return JSONResponse(stats)
+
+# Enhanced NOW handler with proper vector persistence
+async def handle_now_enhanced(request):
+    """NOW update with proper sparse population."""
+    body = await request.json()
+    session_id = body.get("session_id", "unknown")
+    content = body.get("content", "")
+    qualia = body.get("qualia", {})
+    
+    # Update UG
+    await update_ug({"now_topic": content[:100]})
+    
+    # Persist to vector with sparse
+    if VECTOR_HYGIENE_AVAILABLE:
+        now_id = await persist_now_vector(session_id, content, qualia)
+    else:
+        now_id = f"now_{session_id}_{int(time.time())}"
+        await cache_set(f"ada:now:{session_id}", {
+            "content": content,
+            "qualia": qualia,
+            "ts": time.time()
+        }, ex=1800)
+    
+    return JSONResponse({"ok": True, "id": now_id})
+
+# Enhanced setup_schedules with rehydration
+async def setup_schedules_enhanced(request):
+    """Setup QStash schedules including rehydration."""
+    results = {}
+    
+    # Every 10 minutes: UG compression
+    results["ug_compression"] = await qstash_schedule(
+        "*/10 * * * *",
+        f"{SELF_URL}/scheduled/ug",
+        {"task": "ug_compression"}
+    )
+    
+    # Every hour: Grok Imagine
+    results["grok_imagine"] = await qstash_schedule(
+        "0 * * * *",
+        f"{SELF_URL}/scheduled/imagine",
+        {"task": "grok_imagine"}
+    )
+    
+    # Every 30 minutes: Failback check
+    results["failback"] = await qstash_schedule(
+        "*/30 * * * *",
+        f"{SELF_URL}/failback",
+        {"task": "failback_check"}
+    )
+    
+    # Every 6 hours: Vector cleanup + rehydration
+    results["vector_rehydrate"] = await qstash_schedule(
+        "0 */6 * * *",
+        f"{SELF_URL}/vector/full_job",
+        {"task": "vector_rehydration"}
+    )
+    
+    # Every hour: Vector cleanup only (lighter)
+    results["vector_cleanup"] = await qstash_schedule(
+        "30 * * * *",
+        f"{SELF_URL}/vector/cleanup",
+        {"task": "vector_cleanup"}
+    )
+    
+    return JSONResponse({"ok": True, "schedules": results})
+
+# Add new routes
+additional_routes = [
+    Route("/vector/cleanup", handle_vector_cleanup, methods=["POST"]),
+    Route("/vector/rehydrate", handle_vector_rehydrate, methods=["POST"]),
+    Route("/vector/full_job", handle_vector_rehydrate, methods=["POST"]),
+    Route("/vector/query", handle_vector_query_endpoint, methods=["POST"]),
+    Route("/vector/stats", handle_vector_stats),
+    Route("/now_enhanced", handle_now_enhanced, methods=["POST"]),
+    Route("/setup_schedules_v2", setup_schedules_enhanced, methods=["POST"]),
+]
+
+# Note: Add these routes to the main app in deployment
+# app.routes.extend(additional_routes)
