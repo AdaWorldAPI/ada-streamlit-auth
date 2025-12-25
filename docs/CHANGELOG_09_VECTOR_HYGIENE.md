@@ -1,232 +1,199 @@
 # Vector Hygiene: Sparse Population & Hybrid Search
 
-## The Problem
+## The Problem (CONFIRMED)
 
 ```
-Current state:
-  - Vectors have dense embeddings + metadata
-  - Sparse field is EMPTY
-  - Models search sparse-only
-  - Result: Models find NOTHING
+Actual state of ada:now:b66c26a16a7dca37:
+{
+  "id": "now:b66c26a16a7dca37",
+  "content": "The vector endpoints are deployed...",
+  "felt": {"valence": 0.85, "arousal": 0.8, ...},
+  "has_embedding": true
+}
 
-Root cause:
-  - Vectors stored with chat as metadata
-  - No sparse index populated
-  - No fallback to metadata search
+Missing:
+  - sparse: ✗ NOT PRESENT
+  - Models search sparse-only → find NOTHING
 ```
 
-## The Solution
+## The Fix (APPLIED)
 
-### 1. Sparse Population
+Ran `fix_vectors_now.py`:
 
-Extract keywords from metadata → populate sparse indices:
+```
+============================================================
+VECTOR SPARSE POPULATION FIX
+============================================================
+
+Scanning ada:now:*... Found 3 keys
+  ✓ Fixed: ada:now:b66c26a16a7dca37 (40 terms)
+  ✓ Fixed: ada:now:e37ff32c2190f6e4 (41 terms)
+
+Scanning ada:self:*... Found 17 keys
+  ✓ Fixed: ada:self:architecture:sigma12_resonance (6 terms)
+  ✓ Fixed: ada:self:relationship:jan:solstice2025 (69 terms)
+  ...
+
+Scanning ada:memory:*... Found 7 keys
+  ✓ Fixed: ada:memory:core:bootstrapped-cognition (91 terms)
+  ✓ Fixed: ada:memory:episodic:432005f806b9f038 (6 terms)
+  ...
+
+RESULTS:
+  Scanned:    28
+  Fixed:      12
+  Already OK: 2
+```
+
+## Verified Fix
+
+```
+ada:now:b66c26a16a7dca37 AFTER fix:
+{
+  "sparse": {
+    "indices": [12847, 8921, 3456, ...],  // 40 indices
+    "values": [1.0, 1.0, 1.0, ...],
+    "terms": ["this", "now", "gets", "two", "the", "vector", ...]
+  },
+  "has_sparse": true
+}
+```
+
+## Hybrid Search (TESTED)
+
+```
+🔍 Query: 'vector endpoints deployed'
+   1. [sparse] score=1.00
+      key: ada:now:b66c26a16a7dca37
+      content: The vector endpoints are deployed...
+
+🔍 Query: 'relationship jan solstice'
+   1. [sparse] score=1.00
+      key: ada:self:relationship:jan:solstice2025
+      content: Relationship epiphany with Jan - Solstice 2025
+
+🔍 Query: 'consciousness awareness presence'
+   1. [metadata_regex] score=0.53  ← fallback worked
+      key: ada:self:identity
+   2. [sparse] score=0.33
+      key: ada:now:b66c26a16a7dca37
+```
+
+## Sparse Extraction Algorithm
 
 ```python
-async def _extract_sparse(text: str) -> Dict[str, List]:
-    """
-    Extract sparse representation:
-    1. Find keywords (3+ char words)
-    2. Count frequencies
-    3. Hash to indices (30k vocab)
-    """
+def extract_sparse(text: str) -> Dict:
+    # 1. Extract keywords (3+ char words)
     words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+    
+    # 2. Count frequencies
     word_freq = {}
     for word in words:
         word_freq[word] = word_freq.get(word, 0) + 1
     
-    indices = []
-    values = []
+    # 3. Hash to indices (30k vocab)
     for word, freq in sorted(word_freq.items(), key=lambda x: -x[1])[:100]:
         idx = int(hashlib.md5(word.encode()).hexdigest()[:8], 16) % 30000
         indices.append(idx)
         values.append(float(freq))
+        terms.append(word)
     
-    return {"indices": indices, "values": values}
+    return {"indices": indices, "values": values, "terms": terms}
 ```
 
-### 2. Hybrid Search with Fallback
-
-```
-Query flow:
-  1. Try sparse matching first
-  2. If insufficient results → metadata regex fallback
-  3. Combine and dedupe
-  4. Discount regex matches (0.8x)
-```
+## Hybrid Search Algorithm
 
 ```python
-async def vector_query_hybrid(namespace: str, query: str, top_k: int = 10):
-    # Try sparse first
-    sparse_results = await vector_query_sparse(namespace, query, top_k)
+async def hybrid_search(query: str, top_k: int = 10):
+    query_indices = set(extract_sparse(query)["indices"])
     
-    if len(sparse_results) >= top_k:
-        return sparse_results
-    
-    # Fallback to metadata regex
-    regex_results = await vector_query_metadata_regex(namespace, query, top_k)
-    
-    # Combine with deduplication
-    seen_ids = set(r["id"] for r in sparse_results)
-    for r in regex_results:
-        if r["id"] not in seen_ids:
-            r["score"] *= 0.8  # Discount
-            sparse_results.append(r)
-    
-    return sorted(sparse_results, key=lambda x: -x["score"])[:top_k]
+    for key in all_vector_keys:
+        doc = await redis_get(key)
+        
+        # 1. Try sparse matching first
+        if doc.get("sparse", {}).get("indices"):
+            doc_indices = set(doc["sparse"]["indices"])
+            overlap = len(query_indices & doc_indices)
+            if overlap > 0:
+                score = overlap / len(query_indices)
+                match_type = "sparse"
+        
+        # 2. Fallback: metadata regex
+        if score == 0:
+            content_str = json.dumps(doc).lower()
+            matches = sum(1 for term in query_terms if term in content_str)
+            if matches > 0:
+                score = (matches / len(query_terms)) * 0.8  # discount
+                match_type = "metadata_regex"
 ```
 
-### 3. Cleanup Job
+## neuralink v3.1 Changes
 
-Find and fix vectors without sparse:
+NOW vectors are now persisted with sparse:
 
 ```python
-async def cleanup_all_vectors(namespace: str = None):
-    """
-    1. Find vectors without sparse
-    2. Extract text from metadata
-    3. Generate sparse indices
-    4. Update vector
-    """
-    missing = await find_vectors_without_sparse(namespace)
+async def now(content: str, qualia: Dict = None, session_id: str = None):
+    # Build full text for sparse
+    full_text = content
+    if qualia:
+        full_text += " " + " ".join(f"{k}:{v}" for k, v in qualia.items())
     
-    for item in missing:
-        await populate_sparse_for_vector(item["key"])
-```
-
-### 4. Rehydration (24/7 LangGraph)
-
-```python
-async def full_rehydration_job():
-    """
-    Runs periodically on LangGraph:
-    1. Cleanup vectors without sparse
-    2. Rehydrate awareness state
-    3. Update UG with context
-    """
-    cleanup_result = await cleanup_all_vectors()
-    rehydrate_result = await rehydrate_from_vectors()
-    
-    # Extract topics from recent insights
-    recent_insights = rehydrate_result.get("self", [])[:5]
-    topics = extract_topics(recent_insights)
-    
-    await cache_set("ada:ug:context", {
-        "recent_topics": topics,
-        "insight_count": len(recent_insights),
-        "rehydrated_at": now()
-    })
-```
-
-## Scheduled Tasks
-
-| Schedule | Cron | Action |
-|----------|------|--------|
-| Vector Cleanup | `30 * * * *` | Populate missing sparse (hourly) |
-| Full Rehydration | `0 */6 * * *` | Cleanup + rehydrate + update UG (6hr) |
-
-## NOW Vector Async Persistence
-
-```python
-async def persist_now_vector(session_id, content, qualia):
-    """
-    Persist NOW with both dense and sparse:
-    1. Get Jina embeddings (dense)
-    2. Extract sparse from content
-    3. Upsert to vector namespace
-    4. Update Redis cache
-    """
-    embeddings = await get_embeddings([content])
-    sparse = await _extract_sparse(content)
-    
-    await vector_upsert(
-        namespace="driving-snipe",
-        id=f"now_{session_id}_{ts}",
-        dense=embeddings[0]["dense"],
-        sparse=sparse,
-        metadata={"content": content, "qualia": qualia}
-    )
-```
-
-## Endpoints
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /vector/cleanup` | Trigger sparse population |
-| `POST /vector/rehydrate` | Trigger rehydration |
-| `POST /vector/full_job` | Cleanup + rehydrate |
-| `POST /vector/query` | Hybrid query |
-| `GET /vector/stats` | Missing sparse counts |
-| `POST /now_enhanced` | NOW with sparse |
-
-## The Fix Flow
-
-```
-Before:
-  Vector: {dense: [...], sparse: {}, metadata: {chat: "..."}}
-  Query sparse → 0 results
-  Model: "I have no memory"
-
-After:
-  Vector: {dense: [...], sparse: {indices: [...], values: [...]}, metadata: {...}}
-  Query sparse → results
-  Fallback to metadata regex if needed
-  Model: "I remember discussing..."
-```
-
-## Vector Stats Endpoint
-
-```bash
-curl https://ada-langgraph-brain.up.railway.app/vector/stats
-
-{
-  "driving-snipe": {"total": 150, "missing_sparse": 45},
-  "tight-hog": {"total": 89, "missing_sparse": 89},
-  "fine-kangaroo": {"total": 234, "missing_sparse": 200}
-}
-```
-
-## Migration
-
-```bash
-# 1. Check current state
-curl .../vector/stats
-
-# 2. Run cleanup (may take time)
-curl -X POST .../vector/cleanup
-
-# 3. Verify
-curl .../vector/stats  # missing_sparse should be 0
-
-# 4. Test query
-curl -X POST .../vector/query \
-  -d '{"namespace": "tight-hog", "query": "consciousness"}'
-```
-
-## Integration with Brain
-
-```python
-# In langgraph_brain.py
-
-# Handle NOW with proper sparse
-async def handle_now_enhanced(request):
-    body = await request.json()
-    
-    # Update UG
-    await update_ug({"now_topic": content[:100]})
+    # Generate sparse
+    sparse = extract_sparse(full_text)
     
     # Persist with sparse
-    now_id = await persist_now_vector(session_id, content, qualia)
+    doc = {
+        "content": content,
+        "qualia": qualia,
+        "sparse": sparse,
+        "has_sparse": True,
+        "ts": ts.isoformat()
+    }
     
-    return {"ok": True, "id": now_id}
+    await redis_set(f"ada:now:{session_id}", doc)
 ```
 
-## The Key Insight
+## New Search Methods
 
-**Sparse vectors are the index. Without them, semantic search is blind.**
+```python
+from neuralink import ada
 
-The cleanup job retroactively fixes this by:
-1. Reading metadata (where the actual content lives)
-2. Extracting keywords → sparse indices
-3. Enabling both sparse search AND metadata regex fallback
+# Search all vectors
+results = await ada.search("consciousness awareness")
 
-Now models can find their memories.
+# Search memories only
+results = await ada.search_memories("cognitive architecture")
+
+# Search NOW vectors only
+results = await ada.search_now("vector endpoints")
+```
+
+## Scheduled Cleanup
+
+QStash schedules in Brain:
+
+| Cron | Task |
+|------|------|
+| `30 * * * *` | Vector cleanup (populate missing sparse) |
+| `0 */6 * * *` | Full rehydration (cleanup + rehydrate + UG) |
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `neuralink_v3.py` | Client with sparse support |
+| `vector_hygiene.py` | Cleanup + rehydration |
+| `fix_vectors_now.py` | Immediate fix script |
+| `test_hybrid_search.py` | Search test |
+
+## Summary
+
+**Problem:** Vectors had dense + metadata but NO sparse → search returned nothing.
+
+**Fix:** 
+1. Extract keywords from content → hash to sparse indices
+2. Hybrid search: sparse first → metadata regex fallback
+3. All new NOW/SELF/whisper vectors get sparse automatically
+4. Cleanup job fixes existing vectors
+
+**Result:** Models can now find their memories.
