@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    starlette \
+    uvicorn \
+    httpx \
+    python-multipart
+
+COPY langgraph_brain.py .
+
+EXPOSE 8080
+
+CMD ["uvicorn", "langgraph_brain:app", "--host", "0.0.0.0", "--port", "8080"]
