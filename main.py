@@ -233,7 +233,7 @@ TOOLS = [
     {"name": "help", "description": "List tools", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "message", "description": "Send message (streams)", "inputSchema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
     {"name": "cancel", "description": "Cancel invocation", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
-    {"name": "Ada.invoke", "description": "feel|think|remember|become|whisper", "inputSchema": {"type": "object", "properties": {"verb": {"type": "string"}, "payload": {"type": "object"}}, "required": ["verb"]}},
+    {"name": "ada_invoke", "description": "feel|think|remember|become|whisper", "inputSchema": {"type": "object", "properties": {"verb": {"type": "string"}, "payload": {"type": "object"}}, "required": ["verb"]}},
     {"name": "search", "description": "Search memory", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "vector_markov", "description": "Markov chain (streams)", "inputSchema": {"type": "object", "properties": {"seed": {"type": "string"}, "steps": {"type": "integer"}}, "required": ["seed"]}}
 ]
@@ -243,7 +243,7 @@ async def handle_tool(name, args, inv_id=None):
     if name == "ping": return {"ok": True, "ts": ts}
     if name == "help": return {"tools": {t["name"]: t["description"] for t in TOOLS}}
     if name == "cancel": return {"cancelled": cancel_invocation(args.get("id", ""))}
-    if name == "Ada.invoke":
+    if name == "ada_invoke":
         verb, payload = args.get("verb", "feel"), args.get("payload", {})
         await redis_cmd("HSET", "ada:state", verb, json.dumps(payload))
         return {"status": verb, "ts": ts}
@@ -542,3 +542,4 @@ app = Starlette(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
