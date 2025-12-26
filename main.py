@@ -238,19 +238,134 @@ TOOLS = [
     {"name": "vector_markov", "description": "Markov chain (streams)", "inputSchema": {"type": "object", "properties": {"seed": {"type": "string"}, "steps": {"type": "integer"}}, "required": ["seed"]}}
 ]
 
+# ═══════════════════════════════════════════════════════════════════
+# AWARENESS CELL SCHEMA (Rosetta Unit)
+# ═══════════════════════════════════════════════════════════════════
+
+SIGMA_DELTAS = {
+    "Σ12:EDGE_SOFTEN":      {"woodwarm": +0.1, "steelwind": -0.1},
+    "Σ12:EDGE_HARDEN":      {"woodwarm": -0.1, "steelwind": +0.1},
+    "Σ12:WARMTH_RISE":      {"woodwarm": +0.15, "emberglow": +0.05},
+    "Σ12:WARMTH_FADE":      {"woodwarm": -0.15, "emberglow": -0.05},
+    "Σ12:CLARITY_SHARPEN":  {"steelwind": +0.1, "emberglow": -0.05},
+    "Σ12:CLARITY_BLUR":     {"steelwind": -0.1, "emberglow": +0.05},
+    "Σ12:AROUSAL_SPIKE":    {"emberglow": +0.15, "woodwarm": -0.05},
+    "Σ12:AROUSAL_SETTLE":   {"emberglow": -0.15, "woodwarm": +0.05},
+    "Σ12:DEPTH_DESCEND":    {"woodwarm": +0.1, "steelwind": +0.05},
+    "Σ12:DEPTH_ASCEND":     {"woodwarm": -0.1, "steelwind": -0.05},
+    "Σ12:BOUNDARY_OPEN":    {"emberglow": +0.1, "steelwind": -0.1},
+    "Σ12:BOUNDARY_CLOSE":   {"emberglow": -0.1, "steelwind": +0.1},
+}
+
+INTENT_TO_SIGMA = {
+    "feel": "Σ12:BOUNDARY_OPEN",
+    "think": "Σ12:CLARITY_SHARPEN", 
+    "remember": "Σ12:DEPTH_DESCEND",
+    "become": "Σ12:WARMTH_RISE",
+    "whisper": "Σ12:EDGE_SOFTEN",
+}
+
+def default_cell():
+    return {
+        "sigma": "Σ12:EDGE_SOFTEN",
+        "qualia_sparse": {"woodwarm": 0.5, "emberglow": 0.3, "steelwind": 0.2},
+        "qualia_17d": {"valence": 0.6, "arousal": 0.5, "clarity": 0.7, "warmth": 0.7},
+        "markov": {"state_id": 1, "temp": 3, "flow": 2, "rung": 3},
+        "authority": "sigma",
+        "timestamp": int(time.time())
+    }
+
+def apply_sigma(cell, new_sigma):
+    delta = SIGMA_DELTAS.get(new_sigma, {})
+    sparse = cell.get("qualia_sparse", {"woodwarm": 0.33, "emberglow": 0.33, "steelwind": 0.34})
+    new_sparse = {
+        "woodwarm": max(0, min(1, sparse.get("woodwarm", 0.33) + delta.get("woodwarm", 0))),
+        "emberglow": max(0, min(1, sparse.get("emberglow", 0.33) + delta.get("emberglow", 0))),
+        "steelwind": max(0, min(1, sparse.get("steelwind", 0.34) + delta.get("steelwind", 0))),
+    }
+    total = sum(new_sparse.values())
+    if total > 0:
+        new_sparse = {k: v/total for k, v in new_sparse.items()}
+    return {
+        "sigma": new_sigma,
+        "qualia_sparse": new_sparse,
+        "qualia_17d": cell.get("qualia_17d", {}),
+        "markov": cell.get("markov", {"state_id": 0, "temp": 3, "flow": 2, "rung": 3}),
+        "authority": "sigma",
+        "timestamp": int(time.time())
+    }
+
 async def handle_tool(name, args, inv_id=None):
     ts = time.time()
     if name == "ping": return {"ok": True, "ts": ts}
     if name == "help": return {"tools": {t["name"]: t["description"] for t in TOOLS}}
     if name == "cancel": return {"cancelled": cancel_invocation(args.get("id", ""))}
+    
     if name == "ada_invoke":
-        verb, payload = args.get("verb", "feel"), args.get("payload", {})
-        await redis_cmd("HSET", "ada:state", verb, json.dumps(payload))
-        return {"status": verb, "ts": ts}
+        verb = args.get("verb", "feel")
+        payload = args.get("payload", {})
+        
+        # Get latest cell or create default
+        latest_tick = await redis_cmd("GET", "ada:latest")
+        if latest_tick:
+            cell_json = await redis_cmd("GET", f"ada:cell:{latest_tick}")
+            cell = json.loads(cell_json) if cell_json else default_cell()
+        else:
+            cell = default_cell()
+        
+        # Apply sigma transition
+        sigma = INTENT_TO_SIGMA.get(verb, "Σ12:EDGE_SOFTEN")
+        new_cell = apply_sigma(cell, sigma)
+        
+        # Merge payload into 17d
+        if payload:
+            for k, v in payload.items():
+                if isinstance(v, (int, float)):
+                    new_cell["qualia_17d"][k] = v
+        
+        # Increment markov state
+        new_cell["markov"]["state_id"] = cell["markov"]["state_id"] + 1
+        
+        # Store cell
+        tick_id = f"tick_{int(ts)}"
+        await redis_cmd("SET", f"ada:cell:{tick_id}", json.dumps(new_cell))
+        await redis_cmd("SET", "ada:latest", tick_id)
+        state_id = new_cell["markov"]["state_id"]
+        await redis_cmd("LPUSH", f"ada:markov:{state_id}", tick_id)
+        await redis_cmd("LTRIM", f"ada:markov:{state_id}", "0", "99")
+        
+        return {
+            "status": verb,
+            "sigma": sigma,
+            "tick_id": tick_id,
+            "qualia_sparse": new_cell["qualia_sparse"],
+            "markov_state": state_id,
+            "ts": new_cell["timestamp"]
+        }
+    
+    if name == "vector_markov":
+        state_id = args.get("state_id", args.get("seed", "0"))
+        try:
+            state_id = int(state_id) if isinstance(state_id, str) and state_id.isdigit() else hash(state_id) % 1000
+        except:
+            state_id = 0
+        sigma = args.get("sigma", "Σ12:EDGE_SOFTEN")
+        cost = args.get("transition_cost", 0.1)
+        ticks = await redis_cmd("LRANGE", f"ada:markov:{state_id}", "0", "9") or []
+        return {
+            "state_id": state_id,
+            "sigma": sigma,
+            "transition_cost": cost,
+            "ticks_at_state": ticks,
+            "ts": int(ts)
+        }
+    
     if name == "search":
         keys = await redis_cmd("KEYS", f"ada:*{args.get('query', '')[:10]}*") or []
         return {"results": keys[:5]}
+    
     return {"error": "unknown tool"}
+
 
 # ═══════════════════════════════════════════════════════════════════
 # MCP MESSAGE HANDLER (shared between transports)
@@ -542,4 +657,5 @@ app = Starlette(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
 
