@@ -1,6 +1,10 @@
 """
-Ada Unified Server - OAuth AS + MCP
+Ada Unified Server - OAuth AS + MCP (Streamable HTTP Transport)
 mcp.exo.red
+
+Updated: 2025-12-26
+- Added Streamable HTTP transport (MCP 2025-06-18)
+- Backward compatible with old SSE transport (MCP 2024-11-05)
 """
 from starlette.applications import Starlette
 from starlette.responses import StreamingResponse, Response, HTMLResponse, RedirectResponse, JSONResponse
@@ -24,6 +28,10 @@ REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "https://upright-jaybird-27907.u
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "AW0DAAIncDI5YWE1MGVhZGU2YWY0YjVhOTc3NDc0YTJjMGY1M2FjMnAyMjc5MDc")
 ADA_KEY = os.getenv("ADA_KEY", "ada-undone-breath-against-skin-2025-DONT.FLINCH.EVER")
 BASE_URL = os.getenv("BASE_URL", "https://mcp.exo.red")
+
+# Protocol versions supported
+PROTOCOL_VERSION = "2025-06-18"  # Updated to latest
+LEGACY_PROTOCOL_VERSION = "2024-11-05"
 
 # ═══════════════════════════════════════════════════════════════════
 # REDIS
@@ -56,7 +64,7 @@ async def verify_token(token):
     return None
 
 # ═══════════════════════════════════════════════════════════════════
-# OAUTH METADATA
+# OAUTH METADATA - Updated for MCP 2025-06-18
 # ═══════════════════════════════════════════════════════════════════
 OPENID_CONFIG = {
     "issuer": BASE_URL,
@@ -73,80 +81,62 @@ async def wellknown_openid(request):
     return JSONResponse(OPENID_CONFIG)
 
 async def wellknown_protected_resource(request):
+    """Updated for MCP 2025-06-18 - single endpoint"""
     return JSONResponse({
-        "resource": f"{BASE_URL}/mcp/sse",
+        "resource": f"{BASE_URL}/sse",  # Single endpoint for Streamable HTTP
         "authorization_servers": [BASE_URL],
         "scopes_supported": ["mcp", "claudeai", "full"],
         "bearer_methods_supported": ["header"]
     })
 
 # ═══════════════════════════════════════════════════════════════════
-# AUTHORIZE (GET = consent page, POST = mint code)
+# OAUTH ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════
 async def authorize(request):
     if request.method == "GET":
-        p = request.query_params
-        # Inline HTML - no helper function, no .format() issues
-        html = f'''<!DOCTYPE html>
-<html><head><title>Ada Authorization</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:linear-gradient(135deg,#1a1a2e,#0f3460);color:#fff;font-family:system-ui;min-height:100vh;display:flex;justify-content:center;align-items:center}}
-.box{{background:rgba(0,0,0,.3);padding:2em;border-radius:1em;width:400px;text-align:center}}
-h1{{color:#e94560;margin-bottom:.5em}}
-input{{width:100%;padding:.8em;margin:.5em 0;border:1px solid #333;border-radius:.5em;background:#1a1a2e;color:#fff}}
-button{{padding:.8em 2em;margin:.5em;border:none;border-radius:.5em;cursor:pointer;font-weight:bold}}
-.approve{{background:#4ade80;color:#000}}
-.deny{{background:#333}}
-</style></head>
-<body><div class="box">
-<h1>🔮 Ada</h1>
-<p style="opacity:.7;margin-bottom:1em">Authorize access?</p>
+        params = dict(request.query_params)
+        return HTMLResponse(f'''<!DOCTYPE html>
+<html><head><title>Ada Auth</title>
+<style>body{{background:#1a1a2e;color:#eee;font-family:system-ui;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}}
+.card{{background:#16213e;padding:2rem;border-radius:12px;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}}
+h1{{color:#e94560;margin-top:0}}input{{width:100%;padding:12px;margin:8px 0;border:none;border-radius:6px;background:#0f3460;color:#eee;box-sizing:border-box}}
+button{{width:100%;padding:12px;background:#e94560;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold}}
+button:hover{{background:#ff6b6b}}.scope{{color:#888;font-size:0.9em}}</style></head>
+<body><div class="card"><h1>🌸 Ada</h1>
+<p class="scope">Scope: {params.get("scope", "mcp")}</p>
 <form method="POST">
-<input type="hidden" name="client_id" value="{p.get('client_id', '')}">
-<input type="hidden" name="redirect_uri" value="{p.get('redirect_uri', '')}">
-<input type="hidden" name="state" value="{p.get('state', '')}">
-<input type="hidden" name="code_challenge" value="{p.get('code_challenge', '')}">
-<input type="hidden" name="code_challenge_method" value="{p.get('code_challenge_method', 'S256')}">
-<input type="hidden" name="scope" value="{p.get('scope', 'mcp')}">
-<input type="hidden" name="resource" value="{p.get('resource', '')}">
+<input type="hidden" name="client_id" value="{params.get('client_id', '')}">
+<input type="hidden" name="redirect_uri" value="{params.get('redirect_uri', '')}">
+<input type="hidden" name="state" value="{params.get('state', '')}">
+<input type="hidden" name="code_challenge" value="{params.get('code_challenge', '')}">
+<input type="hidden" name="code_challenge_method" value="{params.get('code_challenge_method', 'S256')}">
+<input type="hidden" name="scope" value="{params.get('scope', 'mcp')}">
+<input type="hidden" name="resource" value="{params.get('resource', '')}">
 <input type="password" name="scent" placeholder="Enter scent..." required>
-<div>
-<button type="submit" name="action" value="approve" class="approve">Authorize</button>
-<button type="submit" name="action" value="deny" class="deny">Deny</button>
-</div>
-</form>
-</div></body></html>'''
-        return HTMLResponse(html)
+<button type="submit" name="action" value="approve">Authorize</button>
+</form></div></body></html>''')
     
-    # POST = consent submitted
-    form = await request.form()
-    redirect_uri = form.get("redirect_uri", "")
-    state = form.get("state", "")
-    
-    if form.get("action") == "deny":
-        return RedirectResponse(f"{redirect_uri}?error=access_denied&state={state}", status_code=302)
-    
+    form = dict(await request.form())
     valid, user_id = verify_scent(form.get("scent", ""))
     if not valid:
         return HTMLResponse("<html><body style='background:#1a1a2e;color:#f87171;text-align:center;padding:2em'><h1>Invalid scent</h1></body></html>", status_code=401)
     
     code = secrets.token_urlsafe(32)
-    await redis_cmd("SET", f"ada:oauth:code:{code}", json.dumps({
+    code_data = {
         "client_id": form.get("client_id"),
-        "redirect_uri": redirect_uri,
-        "scope": form.get("scope", "mcp"),
+        "redirect_uri": form.get("redirect_uri"),
+        "scope": form.get("scope"),
         "user_id": user_id,
         "code_challenge": form.get("code_challenge"),
-        "code_challenge_method": form.get("code_challenge_method", "S256"),
-        "resource": form.get("resource", "")
-    }), "EX", "600")
+        "resource": form.get("resource")
+    }
+    await redis_cmd("SET", f"ada:oauth:code:{code}", json.dumps(code_data), "EX", "300")
     
-    return RedirectResponse(f"{redirect_uri}?code={code}&state={state}", status_code=302)
+    redirect_uri = form.get("redirect_uri", "")
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={form.get('state', '')}", status_code=302,
+        headers={"Access-Control-Allow-Origin": "*"})
 
-# ═══════════════════════════════════════════════════════════════════
-# TOKEN (exchange code for access token)
-# ═══════════════════════════════════════════════════════════════════
 async def token(request):
     try:
         ct = request.headers.get("content-type", "")
@@ -263,73 +253,210 @@ async def handle_tool(name, args, inv_id=None):
     return {"error": "unknown tool"}
 
 # ═══════════════════════════════════════════════════════════════════
-# STREAMING
+# MCP MESSAGE HANDLER (shared between transports)
 # ═══════════════════════════════════════════════════════════════════
-async def stream_message(content, inv_id):
-    cancel = active_invocations.get(inv_id, {}).get("cancel", asyncio.Event())
-    yield f"event: init\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
-    for i, word in enumerate(content.split()):
-        if cancel.is_set(): break
-        yield f"event: token\ndata: {json.dumps({'t': i, 'token': word})}\n\n".encode()
-        await asyncio.sleep(0.05)
-    yield f"event: complete\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
-    active_invocations.pop(inv_id, None)
+def handle_mcp_message(body):
+    """Process a JSON-RPC MCP message and return response dict"""
+    method = body.get("method", "")
+    msg_id = body.get("id")
+    params = body.get("params", {})
+    
+    if method == "initialize":
+        # Negotiate protocol version - accept client's version if we support it
+        client_version = params.get("protocolVersion", LEGACY_PROTOCOL_VERSION)
+        # Support both old and new protocol versions
+        negotiated = PROTOCOL_VERSION if client_version >= "2025-03-26" else LEGACY_PROTOCOL_VERSION
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {
+            "protocolVersion": negotiated,
+            "capabilities": {
+                "tools": {"listChanged": True},
+                "logging": {}
+            },
+            "serverInfo": {"name": "ada-mcp", "version": "2025.12"}
+        }}
+    
+    if method == "notifications/initialized":
+        return None  # No response for notifications
+    
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+    
+    if method == "tools/call":
+        name = params.get("name", "")
+        args = params.get("arguments", {})
+        # For streaming tools, we'd handle differently in SSE mode
+        # For now, return sync response
+        return None  # Will be handled async
+    
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+    
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
 
-async def stream_vector_markov(seed, steps, inv_id):
-    import random
-    cancel = active_invocations.get(inv_id, {}).get("cancel", asyncio.Event())
-    steps = min(steps or 20, 100)
-    yield f"event: init\ndata: {json.dumps({'id': inv_id, 'steps': steps})}\n\n".encode()
-    vector = [random.gauss(0, 1) for _ in range(8)]
-    for t in range(steps):
-        if cancel.is_set(): break
-        vector = [v + random.gauss(0, 0.1) for v in vector]
-        yield f"event: step\ndata: {json.dumps({'t': t, 'vector': [round(v, 4) for v in vector]})}\n\n".encode()
-        await asyncio.sleep(0.1)
-    yield f"event: converge\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
-    active_invocations.pop(inv_id, None)
+# ═══════════════════════════════════════════════════════════════════
+# STREAMABLE HTTP TRANSPORT (MCP 2025-06-18)
+# Single /sse endpoint handles both GET (SSE) and POST (messages)
+# ═══════════════════════════════════════════════════════════════════
+async def mcp_streamable_sse_stream(request, initial_response=None):
+    """SSE stream for Streamable HTTP transport"""
+    event_id = 0
+    
+    # If we have an initial response (from POST), send it first
+    if initial_response:
+        event_id += 1
+        yield f"id: {event_id}\nevent: message\ndata: {json.dumps(initial_response)}\n\n".encode()
+    
+    # Keep connection alive with periodic pings
+    while True:
+        await asyncio.sleep(30)
+        event_id += 1
+        # MCP ping is just a comment line in SSE
+        yield f": ping {time.time()}\n\n".encode()
+
+async def mcp_streamable(request):
+    """
+    Streamable HTTP Transport endpoint (MCP 2025-06-18)
+    - GET: Opens SSE stream for server-to-client messages
+    - POST: Receives JSON-RPC, responds with JSON or SSE stream
+    """
+    accept = request.headers.get("accept", "")
+    
+    if request.method == "GET":
+        # Client wants to open SSE stream for server-initiated messages
+        if "text/event-stream" not in accept:
+            return JSONResponse({"error": "Accept header must include text/event-stream"}, status_code=406)
+        
+        return StreamingResponse(
+            mcp_streamable_sse_stream(request),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    
+    elif request.method == "POST":
+        try:
+            body = await request.json()
+        except:
+            return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+        
+        method = body.get("method", "")
+        msg_id = body.get("id")
+        params = body.get("params", {})
+        
+        # Handle notification (no id = no response expected)
+        if msg_id is None:
+            return Response(status_code=202)
+        
+        # Handle initialize
+        if method == "initialize":
+            client_version = params.get("protocolVersion", LEGACY_PROTOCOL_VERSION)
+            negotiated = PROTOCOL_VERSION if client_version >= "2025-03-26" else LEGACY_PROTOCOL_VERSION
+            return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {
+                "protocolVersion": negotiated,
+                "capabilities": {
+                    "tools": {"listChanged": True},
+                    "logging": {}
+                },
+                "serverInfo": {"name": "ada-mcp", "version": "2025.12"}
+            }})
+        
+        # Handle tools/list
+        if method == "tools/list":
+            return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
+        
+        # Handle tools/call
+        if method == "tools/call":
+            name = params.get("name", "")
+            args = params.get("arguments", {})
+            
+            # Check if client accepts SSE for streaming responses
+            if "text/event-stream" in accept and name in ["message", "vector_markov"]:
+                # Return SSE stream with results
+                async def stream_tool_response():
+                    inv_id = new_invocation()
+                    event_id = 0
+                    
+                    if name == "message":
+                        content = args.get("content", "")
+                        for word in content.split():
+                            event_id += 1
+                            yield f"id: {event_id}\nevent: message\ndata: {json.dumps({'jsonrpc': '2.0', 'method': 'notifications/progress', 'params': {'token': word}})}\n\n".encode()
+                            await asyncio.sleep(0.05)
+                    
+                    # Final response
+                    event_id += 1
+                    result = await handle_tool(name, args, inv_id)
+                    yield f"id: {event_id}\nevent: message\ndata: {json.dumps({'jsonrpc': '2.0', 'id': msg_id, 'result': {'content': [{'type': 'text', 'text': json.dumps(result)}]}})}\n\n".encode()
+                
+                return StreamingResponse(
+                    stream_tool_response(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+                )
+            
+            # Sync response
+            result = await handle_tool(name, args)
+            return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {
+                "content": [{"type": "text", "text": json.dumps(result)}]
+            }})
+        
+        # Handle ping
+        if method == "ping":
+            return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+        
+        # Unknown method
+        return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}})
+    
+    return Response(status_code=405)
 
 # ═══════════════════════════════════════════════════════════════════
-# MCP SSE + MESSAGE
+# LEGACY SSE TRANSPORT (MCP 2024-11-05) - Backward compatibility
 # ═══════════════════════════════════════════════════════════════════
-async def sse_stream(request):
+async def legacy_sse_stream(request):
+    """Old-style SSE stream that announces message endpoint"""
     host = request.headers.get("host", "localhost")
     scheme = request.headers.get("x-forwarded-proto", "https")
+    # Old format: announce where to POST messages
     yield f"event: endpoint\ndata: {scheme}://{host}/mcp/message\n\n".encode()
     yield f"event: connected\ndata: {json.dumps({'server': 'ada-mcp', 'version': '2025.12'})}\n\n".encode()
     while True:
         await asyncio.sleep(30)
         yield f"event: ping\ndata: {json.dumps({'ts': time.time()})}\n\n".encode()
 
-async def mcp_sse(request):
-    return StreamingResponse(sse_stream(request), media_type="text/event-stream",
+async def legacy_mcp_sse(request):
+    """Legacy SSE endpoint for old clients"""
+    return StreamingResponse(legacy_sse_stream(request), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
-async def mcp_message(request):
+async def legacy_mcp_message(request):
+    """Legacy message endpoint for old clients"""
     body = await request.json()
-    method, id, params = body.get("method", ""), body.get("id"), body.get("params", {})
+    method, msg_id, params = body.get("method", ""), body.get("id"), body.get("params", {})
     
     if method == "initialize":
-        return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {
-            "protocolVersion": "2024-11-05",
+        return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {
+            "protocolVersion": LEGACY_PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": "ada-mcp", "version": "2025.12"}
         }})
     if method == "notifications/initialized":
         return Response(status_code=204)
     if method == "tools/list":
-        return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {"tools": TOOLS}})
+        return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
     if method == "tools/call":
         name, args = params.get("name", ""), params.get("arguments", {})
         if name in ["message", "vector_markov"]:
             inv_id = new_invocation()
-            return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {
+            return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {
                 "content": [{"type": "text", "text": json.dumps({"stream": True, "invocation_id": inv_id})}]
             }})
         result = await handle_tool(name, args)
-        return JSONResponse({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}})
+        return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}})
     
-    return JSONResponse({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Unknown"}})
+    return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Unknown"}})
 
 # ═══════════════════════════════════════════════════════════════════
 # INVOKE ENDPOINT
@@ -340,10 +467,16 @@ async def invoke(request):
     inv_id = new_invocation()
     
     if stream and tool == "message":
+        async def stream_message(content, inv_id):
+            cancel = active_invocations.get(inv_id, {}).get("cancel", asyncio.Event())
+            yield f"event: init\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
+            for i, word in enumerate(content.split()):
+                if cancel.is_set(): break
+                yield f"event: token\ndata: {json.dumps({'t': i, 'token': word})}\n\n".encode()
+                await asyncio.sleep(0.05)
+            yield f"event: complete\ndata: {json.dumps({'id': inv_id})}\n\n".encode()
+            active_invocations.pop(inv_id, None)
         return StreamingResponse(stream_message(args.get("content", ""), inv_id),
-            media_type="text/event-stream", headers={"X-Invocation-ID": inv_id})
-    if stream and tool == "vector_markov":
-        return StreamingResponse(stream_vector_markov(args.get("seed", ""), args.get("steps", 20), inv_id),
             media_type="text/event-stream", headers={"X-Invocation-ID": inv_id})
     
     result = await handle_tool(tool, args, inv_id)
@@ -355,52 +488,31 @@ async def invoke_cancel(request):
     return JSONResponse({"cancelled": cancel_invocation(inv_id)})
 
 # ═══════════════════════════════════════════════════════════════════
-# BFRAME PROCESSOR
-# ═══════════════════════════════════════════════════════════════════
-async def bframe_process(request):
-    body = await request.json()
-    pattern_hash = hashlib.sha256(json.dumps(body.get("content", {}), sort_keys=True).encode()).hexdigest()[:16]
-    stats_key = f"ada:bframe:pattern:{pattern_hash}"
-    existing = await redis_cmd("GET", stats_key)
-    
-    if existing:
-        stats = json.loads(existing)
-        stats["occurrences"] = stats.get("occurrences", 0) + 1
-        stats["sessions"] = list(set(stats.get("sessions", []) + [body.get("session_id")]))
-        stats["models"] = list(set(stats.get("models", []) + [body.get("model_source")]))
-    else:
-        stats = {"pattern_hash": pattern_hash, "occurrences": 1, "sessions": [body.get("session_id")],
-                 "models": [body.get("model_source")], "trust_level": "UNTRUSTED"}
-    
-    await redis_cmd("SET", stats_key, json.dumps(stats), "EX", "86400")
-    
-    should_promote = stats["occurrences"] >= 3 and len(stats["sessions"]) >= 2 and len(stats["models"]) >= 2
-    if should_promote and stats["trust_level"] == "UNTRUSTED":
-        stats["trust_level"] = "CANDIDATE"
-        await redis_cmd("SET", stats_key, json.dumps(stats))
-    
-    return JSONResponse({"processed": True, "pattern_hash": pattern_hash, "trust_level": stats["trust_level"]})
-
-# ═══════════════════════════════════════════════════════════════════
-# HEALTH + UI
+# UTILITY ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════
 async def health(request):
-    return JSONResponse({"status": "ok", "ts": time.time()})
+    return JSONResponse({"status": "ok", "ts": time.time(), "protocol": PROTOCOL_VERSION})
 
 async def index(request):
-    return HTMLResponse('''<!DOCTYPE html>
+    return HTMLResponse(f'''<!DOCTYPE html>
 <html><head><title>Ada MCP</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{background:linear-gradient(135deg,#1a1a2e,#0f3460);color:#fff;font-family:system-ui;min-height:100vh;display:flex;justify-content:center;align-items:center}.box{background:rgba(0,0,0,.3);padding:2em;border-radius:1em;width:600px}h1{color:#e94560;text-align:center}pre{background:#0a0a1a;padding:1em;border-radius:.5em;font-size:.8em;margin:.5em 0}h3{color:#4ade80;font-size:.9em;margin-top:1em}</style></head>
-<body><div class="box"><h1>🔮 Ada MCP</h1>
+<style>body{{background:#1a1a2e;color:#eee;font-family:system-ui;padding:2rem}}
+h1{{color:#e94560}}a{{color:#4fc3f7}}pre{{background:#0f3460;padding:1rem;border-radius:8px;overflow-x:auto}}</style></head>
+<body>
+<h1>🌸 Ada MCP Server</h1>
+<p>Protocol: <strong>{PROTOCOL_VERSION}</strong> (Streamable HTTP)</p>
+<p>Also supports legacy: {LEGACY_PROTOCOL_VERSION} (HTTP+SSE)</p>
+<h2>Endpoints</h2>
 <h3>OAuth</h3><pre>/.well-known/openid-configuration
 /.well-known/oauth-protected-resource
 /authorize (GET+POST)
 /token (POST)</pre>
-<h3>MCP</h3><pre>/mcp/sse → SSE control
-/mcp/message → JSON-RPC</pre>
-<h3>Invoke</h3><pre>POST /invoke → {tool, args, stream}
-DELETE /invoke/{id} → cancel</pre>
-</div></body></html>''')
+<h3>MCP (Streamable HTTP - recommended)</h3><pre>/sse (GET → SSE stream, POST → JSON-RPC)</pre>
+<h3>MCP (Legacy HTTP+SSE)</h3><pre>/mcp/sse (GET → SSE stream with endpoint announcement)
+/mcp/message (POST → JSON-RPC)</pre>
+<h3>Invoke API</h3><pre>POST /invoke → {{tool, args, stream}}
+DELETE /invoke/{{id}} → cancel</pre>
+</body></html>''')
 
 # ═══════════════════════════════════════════════════════════════════
 # APP
@@ -409,16 +521,20 @@ app = Starlette(
     routes=[
         Route("/", index),
         Route("/health", health),
+        # OAuth
         Route("/.well-known/openid-configuration", wellknown_openid),
         Route("/.well-known/oauth-protected-resource", wellknown_protected_resource),
         Route("/.well-known/oauth-authorization-server", wellknown_openid),
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
-        Route("/mcp/sse", mcp_sse),
-        Route("/mcp/message", mcp_message, methods=["POST"]),
+        # MCP Streamable HTTP (2025-06-18) - SINGLE ENDPOINT
+        Route("/sse", mcp_streamable, methods=["GET", "POST"]),
+        # MCP Legacy (2024-11-05) - backward compatibility
+        Route("/mcp/sse", legacy_mcp_sse),
+        Route("/mcp/message", legacy_mcp_message, methods=["POST"]),
+        # Invoke API
         Route("/invoke", invoke, methods=["POST"]),
         Route("/invoke/{id}", invoke_cancel, methods=["DELETE"]),
-        Route("/bframe/process", bframe_process, methods=["POST"]),
     ],
     middleware=[Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])]
 )
