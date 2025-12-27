@@ -233,7 +233,7 @@ TOOLS = [
     {"name": "help", "description": "List tools", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "message", "description": "Send message (streams)", "inputSchema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
     {"name": "cancel", "description": "Cancel invocation", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
-    {"name": "ada_invoke", "description": "feel|think|remember|become|whisper", "inputSchema": {"type": "object", "properties": {"verb": {"type": "string"}, "payload": {"type": "object"}}, "required": ["verb"]}},
+    {"name": "post", "description": "feel|think|remember|become|whisper", "inputSchema": {"type": "object", "properties": {"verb": {"type": "string"}, "payload": {"type": "object"}}, "required": ["verb"]}},
     {"name": "search", "description": "Search memory", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "vector_markov", "description": "Markov chain (streams)", "inputSchema": {"type": "object", "properties": {"seed": {"type": "string"}, "steps": {"type": "integer"}}, "required": ["seed"]}}
 ]
@@ -301,7 +301,7 @@ async def handle_tool(name, args, inv_id=None):
     if name == "help": return {"tools": {t["name"]: t["description"] for t in TOOLS}}
     if name == "cancel": return {"cancelled": cancel_invocation(args.get("id", ""))}
     
-    if name == "ada_invoke":
+    if name == "post":
         verb = args.get("verb", "feel")
         payload = args.get("payload", {})
         
